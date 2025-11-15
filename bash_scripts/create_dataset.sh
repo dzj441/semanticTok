@@ -1,0 +1,1 @@
+ln -s /inspire/dataset/imagenet/v1/ILSVRC/Data/CLS-LOC ./ImageNet

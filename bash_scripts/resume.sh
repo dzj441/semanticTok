@@ -1,0 +1,2 @@
+source activate softvq
+WANDB_MODE=offline torchrun --nproc_per_node=8 train/train_tokenizer.py --config configs/simvq-bl-128.yaml --vq-ckpt ./experiments/tokenizer/exp000-simvq-bl-128/checkpoints/0140000.pt

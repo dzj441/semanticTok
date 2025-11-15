@@ -1,0 +1,71 @@
+results_dir: experiments/tokenizer
+cloud_save_path: experiments/tokenizer # unused
+compile: False 
+global_seed: 42
+log_every: 50
+vis_every: 5000
+ckpt_every: 10000
+eval_every: 10000   
+mixed_precision: bf16
+no_local_save: True
+
+dataset: imagenet
+data_path: ./ImageNet/train
+eval_data_path: "./ImageNet/val"
+image_size: 256
+
+vq_model: VFMTok
+ema: True 
+num_codebooks: 1
+codebook_size: 16384
+codebook_l2_norm: True
+codebook_embed_dim: 12
+entropy_loss_ratio: 0.01
+vq_loss_ratio: 1.0 # codebook loss
+commit_loss_beta: 0.25
+reconstruction_weight: 1.0
+perceptual_weight: 1.0
+perceptual_warmup: 10
+disc_weight: 0.5
+use_diff_aug: True 
+disc_cr_loss_weight: 4.0
+disc_start: 20000
+disc_type: dino
+disc_loss: hinge
+gen_loss: hinge
+lecam_loss_weight: 0.001
+
+enc_type: vit
+encoder_model: vit_large_patch14_dinov2.lvd142m # vit_base_patch14_dinov2.lvd142m vit_base_patch16_dinov3.lvd1689m
+encoder_pretrained: True
+encoder_local_ckpt: "./weights/vit_large_patch14_dinov2_lvd142m.pth" #  "./weights/vit_base_patch14_dinov2_lvd142m.pth" weights/vit_base_patch16_dinov3.lvd1689m/model.safetensors
+encoder_patch_size: 16
+encoder_tuning_method: frozen
+dec_type: vit
+decoder_model: vit_large_patch14_dinov2.lvd142m # vit_large_patch14_dinov2.lvd142m vit_large_patch16_dinov3.lvd1689m
+decoder_pretrained: False 
+decoder_local_ckpt: "./weights/vit_large_patch14_dinov2_lvd142m.pth" # weights/vit_large_patch16_dinov3.lvd1689m/model.safetensors  "./weights/vit_large_patch14_dinov2_lvd142m.pth" 
+decoder_patch_size: 16
+decoder_tuning_method: full
+decoder_up_type: CNN
+num_latent_tokens: 128
+
+repa: False
+repa_proj_dim: 1024
+repa_loss_weight: 0.1
+repa_align: repeat
+cls_recon: False
+cls_recon_weight: 0.0
+
+transformer_config: configs/vfmtok_transformer-siglip.yaml
+codebook_slots_embed_dim: 12
+
+epochs: 50
+lr: 1.0e-4
+optim: adamw
+lr_scheduler: none
+weight_decay: 5e-2
+beta1: 0.9
+beta2: 0.95
+max_grad_norm: 1.0
+global_batch_size: 2
