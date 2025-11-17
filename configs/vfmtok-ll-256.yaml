@@ -59,6 +59,7 @@ cls_recon_weight: 0.0
 
 transformer_config: configs/vfmtok_transformer-siglip.yaml
 codebook_slots_embed_dim: 12
+z_channels: 1024
 
 epochs: 50
 lr: 1.0e-4

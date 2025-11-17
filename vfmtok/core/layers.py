@@ -11,6 +11,47 @@ from einops.layers.torch import Rearrange
 from ..engine.util import instantiate_from_config
 from .transformer import Transformer, DeformableTransformerEncoder, VanillaCrossAttnEncoder, SelfAttnEncoder
 
+
+class DirectFeatureEncoder(nn.Module):
+    """
+    Directly expose backbone patch tokens for quantization.
+    Skips deformable/self-attention aggregation and projector/LayerNorm.
+    """
+    def __init__(
+        self,
+        image_size: int = 256,
+        patch_size: int = 16,
+        dim: int = 1024,
+        encoder_variant: str = "direct",
+        visual_encoder_config=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.dim = dim
+
+        self.backbone = instantiate_from_config(visual_encoder_config)
+        requires_grad(self.backbone, False)
+        self.backbone.eval()
+
+    def freeze_visual_encoder(self):
+        requires_grad(self.backbone, False)
+
+    def freeze(self):
+        self.eval()
+        requires_grad(self, False)
+
+    def forward(self, imgs):
+        with torch.no_grad():
+            feats = self.backbone(imgs)
+        slots = feats[-1]
+        latent = feats[-1]
+        if slots.dim() != 3:
+            slots = rearrange(slots, "b c h w -> b (h w) c")
+        return slots, latent
+
+
 class Encoder(nn.Module):
 
     def __init__(self, image_size, layer_type, n_carrier,

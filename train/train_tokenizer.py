@@ -149,6 +149,7 @@ def main(args):
     # create and load model
     vq_model = VQ_models[args.vq_model](
         image_size=args.image_size,
+        z_channels=args.z_channels,
         codebook_size=args.codebook_size,
         codebook_embed_dim=args.codebook_embed_dim,
         codebook_l2_norm=args.codebook_l2_norm,
@@ -567,6 +568,8 @@ def build_parser():
                         help="Embedding dimension for VFMTok slot quantizer entries")
     parser.add_argument("--decoder-up-type", type=str, default="cnn",
                         choices=["cnn", "linear"], help="Upsampling head used inside VFMTok decoder")
+    parser.add_argument("--z-channels", type=int, default=512,
+                        help="Latent channel dimension (bottleneck channels) for encoder/decoder")
     
     parser.add_argument("--perceptual-weight", type=float, default=1.0, help="perceptual loss weight of LPIPS")
     parser.add_argument("--perceptual-loss", type=str, default='vgg', help="perceptual loss type of LPIPS", choices=['vgg', 'timm', 'tv'])
