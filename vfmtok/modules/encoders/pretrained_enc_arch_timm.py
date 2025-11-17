@@ -9,7 +9,7 @@ import kornia
 import os
 
 
-class SigLIPEmbedder(nn.Module):
+class TimmEmbedder(nn.Module):
     """
     SigLIP v2 embedder that returns multi-level token features (NLC) for specified transformer blocks.
     - Freezes the vision backbone.
