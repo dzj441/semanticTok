@@ -182,7 +182,9 @@ class VQModel(nn.Module):
                 in_channels=config.in_channels,
                 in_dim=config.z_channels,
             )
-        else:
+        elif config.decoder_up_type == "semantic":
+            self.decoder = nn.Identity() # identity don't need pixel decoder
+        elif config.decoder_up_type == "CNN":
             self.decoder = Decoder(
                 ch_mult=config.decoder_ch_mult,
                 z_channels=config.z_channels,

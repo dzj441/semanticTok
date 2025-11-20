@@ -565,7 +565,6 @@ class VFMTokModel(nn.Module, PyTorchModelHubMixin):
         self.model = VFMTokInternalModel(internal_args)
         self.decoder = self.model.decoder
         self.quantize = self.model.slot_quantize
-        print(self)
 
     def encode(self, x: torch.Tensor):
         (quant_slots, latent), emb_loss, q_indices = self.model.encode(x)

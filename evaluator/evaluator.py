@@ -243,3 +243,77 @@ class VQGANEvaluator:
             eval_score["CodebookEntropy"] = entropy
 
         return eval_score
+
+
+class SemanticEvaluator:
+    """Evaluator for semantic reconstruction quality."""
+
+    def __init__(
+        self,
+        device,
+        enable_codebook_usage_measure: bool = False,
+        enable_codebook_entropy_measure: bool = False,
+        num_codebook_entries: int = 1024,
+    ):
+        self._device = device
+        self._enable_codebook_usage_measure = enable_codebook_usage_measure
+        self._enable_codebook_entropy_measure = enable_codebook_entropy_measure
+        self._num_codebook_entries = num_codebook_entries
+        self.reset_metrics()
+
+    def reset_metrics(self):
+        self._num_examples = 0
+        self._cos_sum = 0.0
+        self._l1_sum = 0.0
+        self._l2_sum = 0.0
+        self._set_of_codebook_indices = set()
+        self._codebook_frequencies = torch.zeros(
+            (self._num_codebook_entries), dtype=torch.float64, device=self._device
+        )
+
+    def update(self, teacher_sem: torch.Tensor, pred_sem: torch.Tensor, codebook_indices: Optional[torch.Tensor] = None):
+        if teacher_sem.shape != pred_sem.shape:
+            raise ValueError(
+                f"Teacher/pred semantic feature shapes mismatch: {teacher_sem.shape} vs {pred_sem.shape}"
+            )
+        teacher = teacher_sem.to(self._device)
+        pred = pred_sem.to(self._device)
+
+        flat_teacher = teacher.view(teacher.size(0), -1)
+        flat_pred = pred.view(pred.size(0), -1)
+
+        cosine = F.cosine_similarity(flat_pred, flat_teacher, dim=-1)
+        l1 = F.l1_loss(flat_pred, flat_teacher, reduction="none").mean(dim=-1)
+        l2 = F.mse_loss(flat_pred, flat_teacher, reduction="none").mean(dim=-1)
+
+        self._num_examples += teacher.size(0)
+        self._cos_sum += cosine.sum().item()
+        self._l1_sum += l1.sum().item()
+        self._l2_sum += l2.sum().item()
+
+        if self._enable_codebook_usage_measure and codebook_indices is not None:
+            self._set_of_codebook_indices |= set(torch.unique(codebook_indices, sorted=False).tolist())
+
+        if self._enable_codebook_entropy_measure and codebook_indices is not None:
+            entries, counts = torch.unique(codebook_indices, sorted=False, return_counts=True)
+            self._codebook_frequencies.index_add_(0, entries.int(), counts.double())
+
+    def result(self) -> Mapping[Text, float]:
+        if self._num_examples == 0:
+            raise ValueError("No semantic examples to evaluate.")
+        eval_score = {
+            "rCosine": self._cos_sum / self._num_examples,
+            "rL1": self._l1_sum / self._num_examples,
+            "rL2": self._l2_sum / self._num_examples,
+        }
+
+        if self._enable_codebook_usage_measure:
+            usage = float(len(self._set_of_codebook_indices)) / self._num_codebook_entries
+            eval_score["CodebookUsage"] = usage
+
+        if self._enable_codebook_entropy_measure:
+            probs = self._codebook_frequencies / self._codebook_frequencies.sum()
+            entropy = (-torch.log2(probs + 1e-8) * probs).sum()
+            eval_score["CodebookEntropy"] = entropy
+
+        return eval_score

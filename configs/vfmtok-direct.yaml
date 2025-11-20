@@ -16,10 +16,10 @@ encoder_config:
         feature_levels: [23]
         ckpt_path: ./weights/vit_large_patch16_siglip_384.v2_webli/model.safetensors
 decoder_config:
-  target: vfmtok.core.layers.Decoder
+  target: vfmtok.core.layers.DirectSemanticDecoder
   params:
     layer_type: normal
-    image_size: 256
+    image_size: 384
     patch_size: 16
     dim: 1024
     depth: 6
@@ -28,3 +28,5 @@ decoder_config:
     dim_head: 64
     dropout: 0.1
     n_carrier: 576
+    num_register_tokens: 4
+    semantic_dim: 1024

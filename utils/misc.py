@@ -36,7 +36,7 @@ def str2bool(v):
     
     
 
-def manage_checkpoints(save_dir, keep_last_n=1):
+def manage_checkpoints(save_dir, keep_last_n=0):
     # List all checkpoint files in the save directory
     checkpoints = [f for f in os.listdir(save_dir) if f.endswith('.pt')]
     checkpoints = [f for f in checkpoints if 'best_ckpt' not in f]

@@ -4,8 +4,8 @@ compile: False
 global_seed: 42
 log_every: 50
 vis_every: 5000
-ckpt_every: 100000
-eval_every: 10000     
+ckpt_every: 10000
+eval_every: 10000   
 mixed_precision: bf16
 no_local_save: True
 
@@ -24,16 +24,16 @@ entropy_loss_ratio: 0.01
 vq_loss_ratio: 1.0 # codebook loss
 commit_loss_beta: 0.25
 reconstruction_weight: 1.0
-perceptual_weight: 1.0
-perceptual_warmup: 10
-disc_weight: 0.5
-use_diff_aug: True 
-disc_cr_loss_weight: 4.0
-disc_start: 20000
+perceptual_weight: 0.0
+perceptual_warmup: 0
+disc_weight: 0.0
+use_diff_aug: False
+disc_cr_loss_weight: 0.0
+disc_start: 0
 disc_type: dino
 disc_loss: hinge
 gen_loss: hinge
-lecam_loss_weight: 0.001
+lecam_loss_weight: 0.0
 
 enc_type: vit
 encoder_model: vit_large_patch14_dinov2.lvd142m # vit_base_patch14_dinov2.lvd142m vit_base_patch16_dinov3.lvd1689m
@@ -52,13 +52,13 @@ num_latent_tokens: 128
 
 repa: False
 repa_proj_dim: 1024
-repa_loss_weight: 0.1
+repa_loss_weight: 0.0
 repa_align: repeat
 cls_recon: False
 cls_recon_weight: 0.0
 
 transformer_config: configs/vfmtok-direct.yaml
-codebook_slots_embed_dim: 48
+codebook_slots_embed_dim: 12
 z_channels: 1024
 
 epochs: 50

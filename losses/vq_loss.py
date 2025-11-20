@@ -302,3 +302,84 @@ class VQLoss(nn.Module):
                         log_dict["disc_cr_loss"] = d_cr
                     self.wandb_logger.log(log_dict, step=global_step)
             return d_adversarial_loss
+
+
+class SemVQLoss(nn.Module):
+    """
+    Simplified semantic tokenizer loss: reconstruction (MSE) + codebook losses.
+    Keeps placeholders for perceptual / GAN metrics for unified logging.
+    """
+    def __init__(self, reconstruction_weight: float = 1.0, wandb_logger=None):
+        super().__init__()
+        self.rec_weight = reconstruction_weight
+        self.rec_loss = F.mse_loss
+        self.wandb_logger = wandb_logger
+
+    def forward(self, codebook_loss, targets, predictions, optimizer_idx, global_step,
+                logger=None, log_every=100):
+        if optimizer_idx == 0:
+            rec = self.rec_loss(predictions.contiguous(), targets.contiguous())
+            loss = self.rec_weight * rec + codebook_loss[0] + codebook_loss[1] + codebook_loss[2]
+
+            repa_loss = codebook_loss[4] if len(codebook_loss) > 4 else None
+            cls_mse_loss = codebook_loss[5] if len(codebook_loss) > 5 else None
+            cls_cos_loss = codebook_loss[6] if len(codebook_loss) > 6 else None
+            extra_losses = codebook_loss[7:] if len(codebook_loss) > 7 else ()
+            for extra in extra_losses:
+                loss = loss + extra
+            if repa_loss is not None:
+                loss = loss + repa_loss
+            if cls_mse_loss is not None:
+                loss = loss + cls_mse_loss
+            if cls_cos_loss is not None:
+                loss = loss + cls_cos_loss
+
+            if (global_step % log_every == 0):
+                rec_val = self.rec_weight * rec
+                p_loss = torch.tensor(0.0, device=rec.device)
+                generator_adv_loss = torch.tensor(0.0, device=rec.device)
+                disc_adaptive_weight = torch.tensor(0.0, device=rec.device)
+                disc_weight = torch.tensor(0.0, device=rec.device)
+                codebook_usage = codebook_loss[3] if len(codebook_loss) > 3 else torch.tensor(0.0, device=rec.device)
+                repa_loss_val = repa_loss if repa_loss is not None else torch.tensor(0.0, device=rec.device)
+                cls_mse_val = cls_mse_loss if cls_mse_loss is not None else torch.tensor(0.0, device=rec.device)
+                cls_cos_val = cls_cos_loss if cls_cos_loss is not None else torch.tensor(0.0, device=rec.device)
+                if logger is not None:
+                    logger.info(
+                        f"(Generator) rec_loss: {rec_val:.4f}, perceptual_loss: {p_loss:.4f}, "
+                        f"codebook_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, "
+                        f"entropy_loss: {codebook_loss[2]:.4f}, repa_loss: {repa_loss_val:.4f}, "
+                        f"cls_l2: {cls_mse_val:.4f}, cls_cos: {cls_cos_val:.4f}, "
+                        f"codebook_usage: {codebook_usage:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, "
+                        f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}"
+                    )
+                if self.wandb_logger is not None and tdist.get_rank() == 0:
+                    self.wandb_logger.log({
+                        "rec_loss": rec_val,
+                        "perceptual_loss": p_loss,
+                        "generator_adv_loss": generator_adv_loss,
+                        "codebook_loss": codebook_loss[0],
+                        "commitment_loss": codebook_loss[1],
+                        "entropy_loss": codebook_loss[2],
+                        "repa_loss": repa_loss_val,
+                        "cls_loss_l2": cls_mse_val,
+                        "cls_loss_cos": cls_cos_val,
+                        "codebook_usage": codebook_usage,
+                        "disc_adaptive_weight": disc_adaptive_weight,
+                        "disc_weight": disc_weight,
+                    }, step=global_step)
+            return loss
+
+        if optimizer_idx == 1:
+            zero = torch.zeros_like(codebook_loss[0])
+            if (global_step % log_every == 0):
+                if logger is not None:
+                        logger.info("(Discriminator) discriminator_adv_loss: 0.0000, disc_weight: 0.0000, "
+                                    "logits_real: 0.0000, logits_fake: 0.0000")
+                if self.wandb_logger is not None and tdist.get_rank() == 0:
+                    self.wandb_logger.log({
+                        "disc_adv_loss": 0.0,
+                        "disc_logits_real": 0.0,
+                        "disc_logits_fake": 0.0,
+                    }, step=global_step)
+            return zero

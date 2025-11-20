@@ -32,7 +32,7 @@ from glob import glob
 from copy import deepcopy
 
 from timm.scheduler import create_scheduler_v2 as create_scheduler
-from evaluator import VQGANEvaluator
+from evaluator import VQGANEvaluator, SemanticEvaluator
 
 from utils.logger_func import create_logger
 from utils.distributed import init_distributed_mode
@@ -41,7 +41,7 @@ from utils.misc import str2bool, manage_checkpoints, load_model_state_dict
 from utils.optim import param_groups_weight_decay
 from utils.data import random_crop_arr, center_crop_arr
 from modelling.tokenizer import VQ_models
-from losses.vq_loss import VQLoss
+from losses.vq_loss import VQLoss, SemVQLoss
 
 def seed_everything(TORCH_SEED):
 	random.seed(TORCH_SEED)
@@ -89,6 +89,35 @@ def run_eval(step, model_for_eval, ptdtype,
                 log_dict[f"eval/{k}"] = float(scores[k])
         wandb_logger.log(log_dict, step=step)
 
+    if was_training:
+        model_for_eval.train()
+
+
+@torch.no_grad()
+def run_semantic_eval(step, model_for_eval, ptdtype,
+                      eval_loader,
+                      evaluator,
+                      logger, wandb_logger, device):
+    was_training = model_for_eval.training
+    model_for_eval.eval()
+    evaluator.reset_metrics()
+    for images, _ in eval_loader:
+        images = images.to(device, non_blocking=True)
+        with torch.cuda.amp.autocast(dtype=ptdtype):
+            sem_preds, _, info = model_for_eval(images)
+        teacher_sem = info[0]
+        if teacher_sem is None:
+            raise RuntimeError("Semantic evaluator requires teacher semantic features (info[0]).")
+        codebook_indices = info[2].flatten() if len(info) > 2 else None
+        evaluator.update(teacher_sem, sem_preds, codebook_indices)
+    scores = evaluator.result()
+    parts = [f"[Semantic Eval] step={step}"]
+    for key in ["rCosine", "rL1", "rL2", "CodebookUsage", "CodebookEntropy"]:
+        if key in scores:
+            parts.append(f"{key}={scores[key]:.4f}")
+    logger.info(" | ".join(parts))
+    if wandb_logger is not None:
+        wandb_logger.log({f"eval/{k}": float(v) for k, v in scores.items()}, step=step)
     if was_training:
         model_for_eval.train()
 #################################################################################
@@ -147,6 +176,8 @@ def main(args):
     logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     print(args.transformer_config)
     # create and load model
+    use_semantic_loss = args.decoder_up_type.lower() == "semantic"
+
     vq_model = VQ_models[args.vq_model](
         image_size=args.image_size,
         z_channels=args.z_channels,
@@ -200,6 +231,7 @@ def main(args):
         transformer_config=args.transformer_config,
         codebook_slots_embed_dim=args.codebook_slots_embed_dim,
     )
+    logger.info(f"VQ Model Structure:\n{vq_model}")
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters() if p.requires_grad):,}")
     if args.ema:
         ema = deepcopy(vq_model).to(device)  # Create an EMA of the model for use after training
@@ -208,45 +240,52 @@ def main(args):
     vq_model = vq_model.to(device)
 
 
-    vq_loss = VQLoss(
-        disc_start=args.disc_start, 
-        disc_weight=args.disc_weight,
-        disc_type=args.disc_type,
-        disc_loss=args.disc_loss,
-        disc_dim=args.disc_dim,
-        gen_adv_loss=args.gen_loss,
-        image_size=args.image_size,
-        reconstruction_weight=args.reconstruction_weight,
-        reconstruction_loss=args.reconstruction_loss,
-        codebook_weight=args.codebook_weight,
-        perceptual_loss=args.perceptual_loss,
-        perceptual_model=args.perceptual_model,
-        perceptual_dino_variants=args.perceptual_dino_variants,
-        perceptual_weight=args.perceptual_weight,
-        perceptual_intermediate_loss=args.perceptual_intermediate_loss,
-        perceptural_logit_loss=args.perceptual_logit_loss,
-        perceptual_resize=args.perceptual_resize,
-        perceptual_warmup=args.perceptual_warmup,
-        lecam_loss_weight=args.lecam_loss_weight,
-        disc_cr_loss_weight=args.disc_cr_loss_weight,
-        use_diff_aug=args.use_diff_aug,
-        disc_adaptive_weight=args.disc_adaptive_weight,
-        wandb_logger=wandb_logger
-    ).to(device)
-    logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters() if p.requires_grad):,}")
+    if use_semantic_loss:
+        vq_loss = SemVQLoss(
+            reconstruction_weight=args.reconstruction_weight,
+            wandb_logger=wandb_logger
+        ).to(device)
+        logger.info("Using semantic reconstruction loss (SemVQLoss).")
+    else:
+        vq_loss = VQLoss(
+            disc_start=args.disc_start, 
+            disc_weight=args.disc_weight,
+            disc_type=args.disc_type,
+            disc_loss=args.disc_loss,
+            disc_dim=args.disc_dim,
+            gen_adv_loss=args.gen_loss,
+            image_size=args.image_size,
+            reconstruction_weight=args.reconstruction_weight,
+            reconstruction_loss=args.reconstruction_loss,
+            codebook_weight=args.codebook_weight,
+            perceptual_loss=args.perceptual_loss,
+            perceptual_model=args.perceptual_model,
+            perceptual_dino_variants=args.perceptual_dino_variants,
+            perceptual_weight=args.perceptual_weight,
+            perceptual_intermediate_loss=args.perceptual_intermediate_loss,
+            perceptural_logit_loss=args.perceptual_logit_loss,
+            perceptual_resize=args.perceptual_resize,
+            perceptual_warmup=args.perceptual_warmup,
+            lecam_loss_weight=args.lecam_loss_weight,
+            disc_cr_loss_weight=args.disc_cr_loss_weight,
+            use_diff_aug=args.use_diff_aug,
+            disc_adaptive_weight=args.disc_adaptive_weight,
+            wandb_logger=wandb_logger
+        ).to(device)
+        logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters() if p.requires_grad):,}")
     
     # scaling lr
     args.lr = args.lr * args.global_batch_size / 256
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
-    scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+    scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16')) if not use_semantic_loss else None
     # Setup optimizer
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(vq_model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
-        optimizer_disc = torch.optim.Adam(vq_loss.discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
+        optimizer_disc = torch.optim.Adam(vq_loss.discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2)) if not use_semantic_loss else None
     elif args.optimizer == 'adamw':
         optimizer = torch.optim.AdamW(param_groups_weight_decay(vq_model, weight_decay=args.weight_decay), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
-        optimizer_disc = torch.optim.AdamW(param_groups_weight_decay(vq_loss.discriminator, weight_decay=args.weight_decay), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+        optimizer_disc = torch.optim.AdamW(param_groups_weight_decay(vq_loss.discriminator, weight_decay=args.weight_decay), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay) if not use_semantic_loss else None
 
     # Setup data:
     transform = transforms.Compose([
@@ -303,7 +342,8 @@ def main(args):
     
     # create online evaluator
     evaluator = None
-    if rank == 0 and eval_loader is not None:
+    semantic_evaluator = None
+    if (not use_semantic_loss) and rank == 0 and eval_loader is not None:
         evaluator = VQGANEvaluator(
             device=device,
             enable_rfid=True,
@@ -313,6 +353,14 @@ def main(args):
             num_codebook_entries=args.codebook_size,
         )
         logger.info("Successfully create evaluator")
+    if use_semantic_loss and rank == 0 and eval_loader is not None:
+        semantic_evaluator = SemanticEvaluator(
+            device=device,
+            enable_codebook_usage_measure=True,
+            enable_codebook_entropy_measure=True,
+            num_codebook_entries=args.codebook_size,
+        )
+        logger.info("Successfully create semantic evaluator")
 
     # create lr scheduler
     if args.lr_scheduler == 'none':
@@ -329,16 +377,19 @@ def main(args):
             warmup_epochs=args.lr_warmup_epochs,
             min_lr=args.lr * 0.1,
         )
-        disc_lr_scheduler, _ = create_scheduler(
-            sched=args.lr_scheduler,
-            optimizer=optimizer_disc,
-            patience_epochs=0,
-            step_on_epochs=False,
-            updates_per_epoch=num_update_steps_per_epoch,
-            num_epochs=args.epochs,
-            warmup_epochs=args.lr_warmup_epochs,
-            min_lr=args.lr * 0.1,
-        )
+        if not use_semantic_loss:
+            disc_lr_scheduler, _ = create_scheduler(
+                sched=args.lr_scheduler,
+                optimizer=optimizer_disc,
+                patience_epochs=0,
+                step_on_epochs=False,
+                updates_per_epoch=num_update_steps_per_epoch,
+                num_epochs=args.epochs,
+                warmup_epochs=args.lr_warmup_epochs,
+                min_lr=args.lr * 0.1,
+            )
+        else:
+            disc_lr_scheduler = None
 
     logger.info(f"num_update_steps_per_epoch {num_update_steps_per_epoch:,} max_train_steps ({max_train_steps})")
 
@@ -350,8 +401,9 @@ def main(args):
         if args.ema:
             ema.load_state_dict(checkpoint["ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        vq_loss.discriminator.load_state_dict(load_model_state_dict(checkpoint["discriminator"]))
-        optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
+        if not use_semantic_loss:
+            vq_loss.discriminator.load_state_dict(load_model_state_dict(checkpoint["discriminator"]))
+            optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
 
         # (resume): compute exact resume position at batch-level ===
         # Use the real number of update steps per epoch (already reflects DDP, drop_last, etc.)
@@ -382,17 +434,23 @@ def main(args):
     
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
-        vq_model = torch.compile(vq_model) # requires PyTorch 2.0      
-        vq_loss.discriminator = torch.compile(vq_loss.discriminator)  
-        vq_loss.perceptual_loss = torch.compile(vq_loss.perceptual_loss)
+        vq_model = torch.compile(vq_model) # requires PyTorch 2.0
+        if not use_semantic_loss:
+            vq_loss.discriminator = torch.compile(vq_loss.discriminator)  
+            vq_loss.perceptual_loss = torch.compile(vq_loss.perceptual_loss)
         logger.info("compiling done.")
     
     vq_model = DDP(vq_model.to(device), device_ids=[args.gpu], find_unused_parameters=True)
     vq_model.train()
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
-    vq_loss = DDP(vq_loss.to(device), device_ids=[args.gpu])
-    vq_loss.train()
+    if not use_semantic_loss:
+        vq_loss = DDP(vq_loss.to(device), device_ids=[args.gpu])
+        vq_loss.train()
+    else:
+        vq_loss = vq_loss.to(device)
+        vq_loss.train()
+
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
     
@@ -412,16 +470,23 @@ def main(args):
         for i, (x, y) in enumerate(loader):
             if i < _skip:
                 continue
-            # === END NEW ===
             imgs = x.to(device, non_blocking=True)
 
             # generator training
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss, info = vq_model(imgs)
-                loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
-                                   last_layer=vq_model.module.decoder.last_layer, 
-                                   logger=logger, log_every=args.log_every)
+                if use_semantic_loss:
+                    target_sem = info[0]
+                    if target_sem is None:
+                        raise RuntimeError("Semantic loss requires encoder to return teacher features (info[0]).")
+                    loss_gen = vq_loss(codebook_loss, target_sem, recons_imgs, optimizer_idx=0,
+                                       global_step=train_steps+1, logger=logger, log_every=args.log_every) # here recons_imgs is actually the reconstrcuted semantic feat.
+                else:
+                    last_layer = vq_model.module.decoder.last_layer if hasattr(vq_model.module.decoder, "last_layer") else None
+                    loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
+                                       last_layer=last_layer, 
+                                       logger=logger, log_every=args.log_every)
             scaler.scale(loss_gen).backward()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
@@ -432,19 +497,24 @@ def main(args):
                 update_ema(ema, vq_model.module._orig_mod if args.compile else vq_model.module)
 
             # discriminator training            
-            optimizer_disc.zero_grad()
-            with torch.cuda.amp.autocast(dtype=ptdtype):
-                loss_disc = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
-                                    logger=logger, log_every=args.log_every)
-            scaler_disc.scale(loss_disc).backward()
-            if args.max_grad_norm != 0.0:
-                scaler_disc.unscale_(optimizer_disc)
-                torch.nn.utils.clip_grad_norm_(vq_loss.module.discriminator.parameters(), args.max_grad_norm)
-            scaler_disc.step(optimizer_disc)
-            scaler_disc.update()
+            if not use_semantic_loss:
+                optimizer_disc.zero_grad()
+                with torch.cuda.amp.autocast(dtype=ptdtype):
+                    loss_disc = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
+                                        logger=logger, log_every=args.log_every)
+                scaler_disc.scale(loss_disc).backward()
+                if args.max_grad_norm != 0.0:
+                    scaler_disc.unscale_(optimizer_disc)
+                    torch.nn.utils.clip_grad_norm_(vq_loss.module.discriminator.parameters(), args.max_grad_norm)
+                scaler_disc.step(optimizer_disc)
+                scaler_disc.update()
+            else:
+                loss_disc = torch.tensor(0.0, device=device)
             
             # # Log loss values:
-            running_loss += loss_gen.item() + loss_disc.item()
+            running_loss += loss_gen.item()
+            if not use_semantic_loss:
+                running_loss += loss_disc.item()
             
             log_steps += 1
             train_steps += 1
@@ -469,7 +539,7 @@ def main(args):
                         step=train_steps
                     )
                 
-            if train_steps % args.vis_every == 0:
+            if (not use_semantic_loss) and train_steps % args.vis_every == 0:
                 image = torch.cat([imgs[:4], recons_imgs[:4]], dim=0)
                 image = torch.clamp(image, min=-1, max=1)
                 image = make_grid((image + 1) / 2, nrow=4, padding=0, pad_value=1.0)
@@ -481,19 +551,32 @@ def main(args):
 
             if train_steps % args.eval_every == 0:
                 dist.barrier()
-                if rank == 0 and (eval_loader is not None) and (evaluator is not None):
-                    logger.info(f"(step={train_steps:07d}/total_steps:{max_train_steps:07d}) start Evaluation")
+                if rank == 0 and (eval_loader is not None):
                     model_for_eval = ema if args.ema else (vq_model.module._orig_mod if args.compile else vq_model.module)
-                    run_eval(
-                        step=train_steps,
-                        model_for_eval=model_for_eval,
-                        ptdtype=ptdtype, 
-                        eval_loader=eval_loader,
-                        evaluator=evaluator,
-                        logger=logger,
-                        wandb_logger=wandb_logger,
-                        device=device
-                    )
+                    if use_semantic_loss and semantic_evaluator is not None:
+                        logger.info(f"(step={train_steps:07d}/total_steps:{max_train_steps:07d}) start Semantic Evaluation")
+                        run_semantic_eval(
+                            step=train_steps,
+                            model_for_eval=model_for_eval,
+                            ptdtype=ptdtype,
+                            eval_loader=eval_loader,
+                            evaluator=semantic_evaluator,
+                            logger=logger,
+                            wandb_logger=wandb_logger,
+                            device=device
+                        )
+                    elif (not use_semantic_loss) and (evaluator is not None):
+                        logger.info(f"(step={train_steps:07d}/total_steps:{max_train_steps:07d}) start Evaluation")
+                        run_eval(
+                            step=train_steps,
+                            model_for_eval=model_for_eval,
+                            ptdtype=ptdtype, 
+                            eval_loader=eval_loader,
+                            evaluator=evaluator,
+                            logger=logger,
+                            wandb_logger=wandb_logger,
+                            device=device
+                        )
                 dist.barrier()
 
             # Save checkpoint:
@@ -507,11 +590,12 @@ def main(args):
                     checkpoint = {
                         "model": model_weight,
                         "optimizer": optimizer.state_dict(),
-                        "discriminator": vq_loss.module.discriminator.state_dict(),
-                        "optimizer_disc": optimizer_disc.state_dict(),
                         "steps": train_steps,
                         "args": args
                     }
+                    if not use_semantic_loss:
+                        checkpoint["discriminator"] = vq_loss.module.discriminator.state_dict()
+                        checkpoint["optimizer_disc"] = optimizer_disc.state_dict()
                     if args.ema:
                         checkpoint["ema"] = ema.state_dict()
                     # if not args.no_local_save:
@@ -528,10 +612,12 @@ def main(args):
 
 
     vq_model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-    if rank == 0 and (eval_loader is not None) and (evaluator is not None):
+    if rank == 0 and (eval_loader is not None):
         model_for_eval = ema if args.ema else (vq_model.module._orig_mod if args.compile else vq_model.module)
-        run_eval(train_steps, model_for_eval, ptdtype, eval_loader, evaluator, logger, wandb_logger, device)
+        if use_semantic_loss and semantic_evaluator is not None:
+            run_semantic_eval(train_steps, model_for_eval, ptdtype, eval_loader, semantic_evaluator, logger, wandb_logger, device)
+        elif (not use_semantic_loss) and (evaluator is not None):
+            run_eval(train_steps, model_for_eval, ptdtype, eval_loader, evaluator, logger, wandb_logger, device)
     logger.info("Done!")
     dist.destroy_process_group()
 

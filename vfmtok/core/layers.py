@@ -52,6 +52,87 @@ class DirectFeatureEncoder(nn.Module):
         return slots, latent
 
 
+class DirectSemanticDecoder(nn.Module):
+    """
+    Transformer-based semantic decoder: slots -> semantic tokens (no pixel head).
+    Mirrors Decoder structure but outputs semantic features of dimension semantic_dim.
+    """
+    def __init__(
+        self,
+        layer_type,
+        image_size,
+        patch_size,
+        dim,
+        n_carrier,
+        depth,
+        num_head,
+        mlp_dim,
+        dim_head=64,
+        dropout=0.0,
+        num_register_tokens=4,
+        semantic_dim=1024,
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        assert image_size % patch_size == 0
+        self.dim = dim
+        scale = dim ** -0.5
+        self.num_patches = (image_size // patch_size) ** 2
+        self.num_tokens = 1
+        self.num_register_tokens = num_register_tokens
+
+        self.cls_pos_embedding = nn.Parameter(torch.randn(1, 1, dim) * scale)
+        self.slot_position_embedding = nn.Parameter(torch.randn(1, n_carrier, dim) * scale)
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * scale)
+        self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
+
+        self.transformer = Transformer(layer_type, dim, depth, num_head, dim_head, mlp_dim, dropout, xformer=False)
+        self.norm_post = nn.LayerNorm(dim)
+        self.project_semantic = nn.Linear(dim, semantic_dim)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def interpolate_cls_pos(self):
+        return self.cls_pos_embedding
+
+    def forward(self, slots):
+        bs = slots.size(0)
+        # add slot positional embedding
+        memory = slots + self.slot_position_embedding
+
+        cls_pos = self.cls_pos_embedding
+
+        cls_token = repeat(self.cls_token + cls_pos, 'f ... -> (b f) ...', b=bs)
+        register_tokens = repeat(self.register_tokens, 'f ... -> (b f) ...', b=bs)
+
+        # sequence: <cls> + slots_with_pos + <registers>
+        seq = torch.cat((cls_token, memory, register_tokens), dim=1)
+
+        # self-attention over the full sequence (no causal mask)
+        seq = self.norm_post(seq)
+        mask = ~seq.new_ones((seq.size(1), seq.size(1)), dtype=torch.bool)
+        seq = self.transformer(seq, mask=mask)
+
+        # strip cls/register, keep patch tokens
+        semantic_latent = seq[:, 1:1 + self.num_patches]
+        semantic = self.project_semantic(semantic_latent)
+        return semantic, semantic
+
+
 class Encoder(nn.Module):
 
     def __init__(self, image_size, layer_type, n_carrier,
