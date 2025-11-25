@@ -19,7 +19,7 @@ ema: True
 num_codebooks: 1
 codebook_size: 16384
 codebook_l2_norm: True
-codebook_embed_dim: 12
+codebook_embed_dim: 64
 entropy_loss_ratio: 0.01
 vq_loss_ratio: 1.0 # codebook loss
 commit_loss_beta: 0.25
@@ -49,6 +49,7 @@ decoder_patch_size: 16
 decoder_tuning_method: full
 decoder_up_type: semantic
 num_latent_tokens: 128
+quantizer_type: vq
 semantic_zs: True
 semantic_zs_classnames: imagenet_classnames.txt
 semantic_zs_openclip_model: ViT-L-16-SigLIP2-384
@@ -66,7 +67,7 @@ cls_recon: False
 cls_recon_weight: 0.0
 
 transformer_config: configs/vfmtok-direct.yaml
-codebook_slots_embed_dim: 12
+codebook_slots_embed_dim: 64
 z_channels: 1024
 
 epochs: 50
@@ -77,4 +78,4 @@ weight_decay: 5e-2
 beta1: 0.9
 beta2: 0.95
 max_grad_norm: 1.0
-global_batch_size: 2
+global_batch_size: 512

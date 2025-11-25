@@ -135,6 +135,7 @@ class ModelArgs:
     codebook_show_usage: bool = True
     commit_loss_beta: float = 0.25
     entropy_loss_ratio: float = 0.0
+    quantizer_type: str = "vq"
     
     encoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
     decoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
@@ -194,9 +195,22 @@ class VQModel(nn.Module):
         self.encode_transformer = instantiate_from_config(config.transformer_config.encoder_config)
         self.decode_transformer = instantiate_from_config(config.transformer_config.decoder_config)
 
-        self.slot_quantize = VectorQuantizer(config.codebook_size, config.codebook_slots_embed_dim, 
-                                        config.commit_loss_beta, config.entropy_loss_ratio,
-                                        config.codebook_l2_norm, config.codebook_show_usage)
+        quantizer_type = getattr(config, "quantizer_type", "vq").lower()
+        if quantizer_type == "vq":
+            quantizer_cls = VectorQuantizer
+        elif quantizer_type == "simvq":
+            quantizer_cls = SimVectorQuantizer
+        else:
+            raise ValueError(f"Unsupported quantizer_type '{config.quantizer_type}'")
+
+        self.slot_quantize = quantizer_cls(
+            config.codebook_size,
+            config.codebook_slots_embed_dim,
+            config.commit_loss_beta,
+            config.entropy_loss_ratio,
+            config.codebook_l2_norm,
+            config.codebook_show_usage,
+        )
         self.pre_slots_quant = nn.Linear(config.z_channels, config.codebook_slots_embed_dim)
         self.post_slots_quant = nn.Linear(config.codebook_slots_embed_dim, config.z_channels)
         
@@ -422,7 +436,7 @@ class VectorQuantizer(nn.Module):
         if self.l2_norm:
             self.embedding.weight.data = F.normalize(self.embedding.weight.data, p=2, dim=-1)
         if self.show_usage:
-            self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536*2)))
+            self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536*8)))
 
     
     def forward(self, z):
@@ -488,6 +502,122 @@ class VectorQuantizer(nn.Module):
                 z_q = z_q.view(shape)
         return z_q
 
+
+class SimVectorQuantizer(nn.Module):
+    """SimVQ variant that preserves the original VQ interface (B,C,H,W inputs)."""
+
+    def __init__(
+        self,
+        n_e,
+        e_dim,
+        beta,
+        entropy_loss_ratio,
+        l2_norm,
+        show_usage,
+        simvq=True,
+    ):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+        self.entropy_loss_ratio = entropy_loss_ratio
+        self.l2_norm = l2_norm
+        self.show_usage = show_usage
+        self.simvq = simvq
+
+        self.embedding = nn.Embedding(self.n_e, self.e_dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=self.e_dim ** -0.5)
+        if self.simvq:
+            for p in self.embedding.parameters():
+                p.requires_grad = False
+            self.embedding_proj = nn.Linear(self.e_dim, self.e_dim)
+
+        if self.show_usage:
+            self.register_buffer("codebook_used", torch.zeros(65536*8, dtype=torch.long))
+
+    def _project_weight(self):
+        weight = self.embedding.weight
+        if self.simvq:
+            weight = self.embedding_proj(weight)
+        return weight
+
+    def forward(self, z):
+        if z.dim() != 4:
+            raise ValueError(f"SimVectorQuantizer expects 4D inputs [B,C,H,W], got {tuple(z.shape)}")
+
+        z_bhwc = z.permute(0, 2, 3, 1).contiguous()
+        b, h, w, c = z_bhwc.shape
+        z_flat = z_bhwc.view(b, -1, c)
+        weight = self._project_weight()
+
+        if self.l2_norm:
+            z_for_dist = F.normalize(z_flat, dim=-1, eps=1e-6)
+            weight_for_dist = F.normalize(weight, dim=-1, eps=1e-6)
+        else:
+            z_for_dist = z_flat
+            weight_for_dist = weight
+
+        z2 = (z_for_dist ** 2).sum(dim=-1, keepdim=True)
+        w2 = (weight_for_dist ** 2).sum(dim=-1).view(1, 1, -1)
+        dot = torch.einsum('bld,kd->blk', z_for_dist, weight_for_dist)
+        dists = z2 + w2 - 2 * dot
+
+        indices = torch.argmin(dists, dim=-1)
+        lookup_weight = weight_for_dist if self.l2_norm else weight
+        q = F.embedding(indices, lookup_weight).view(b, h, w, c)
+
+        if self.training:
+            z_cmp = F.normalize(z_bhwc, dim=-1, eps=1e-6) if self.l2_norm else z_bhwc
+            q_cmp = F.normalize(q, dim=-1, eps=1e-6) if self.l2_norm else q
+            codebook_loss = ((q_cmp - z_cmp.detach()) ** 2).mean()
+            commit_loss = self.beta * ((q_cmp.detach() - z_cmp) ** 2).mean()
+            entropy_loss = self.entropy_loss_ratio * compute_entropy_loss(-dists)
+        else:
+            codebook_loss = commit_loss = entropy_loss = None
+
+        z_q = z_bhwc + (q - z_bhwc).detach()
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        if self.show_usage and self.training:
+            flat_idx = indices.reshape(-1)
+            cur_len = min(flat_idx.shape[0], self.codebook_used.shape[0])
+            if cur_len > 0:
+                self.codebook_used[:-cur_len] = self.codebook_used[cur_len:].clone()
+                self.codebook_used[-cur_len:] = flat_idx[:cur_len].detach()
+            usage = len(torch.unique(self.codebook_used)) / self.n_e
+        else:
+            usage = torch.tensor(0.0, device=z.device)
+
+        flat_indices = indices.reshape(-1)
+        return z_q, (codebook_loss, commit_loss, entropy_loss, usage), (None, None, flat_indices)
+
+    def get_codebook_entry(self, indices, shape=None, channel_first=True):
+        weight = self._project_weight()
+        if self.l2_norm:
+            weight = F.normalize(weight, dim=-1, eps=1e-6)
+
+        if indices.dim() == 3:
+            b = indices.size(0)
+            indices = indices.view(b, -1)
+        elif indices.dim() == 2:
+            pass
+        elif indices.dim() == 1:
+            pass
+        else:
+            raise ValueError(f"Unsupported indices shape: {tuple(indices.shape)}")
+
+        flat = indices.reshape(-1).long()
+        feats = F.embedding(flat, weight)
+
+        if shape is None:
+            return feats
+
+        if channel_first:
+            b, c, h, w = shape
+            feats = feats.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+        else:
+            feats = feats.view(*shape)
+        return feats
 
 class ResnetBlock(nn.Module):
     def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.0, norm_type='group'):

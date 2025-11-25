@@ -215,6 +215,7 @@ def main(args):
         codebook_l2_norm=args.codebook_l2_norm,
         commit_loss_beta=args.commit_loss_beta,
         entropy_loss_ratio=args.entropy_loss_ratio,
+        quantizer_type=args.quantizer_type,
         vq_loss_ratio=args.vq_loss_ratio,
         kl_loss_weight=args.kl_loss_weight,
         dropout_p=args.dropout_p,
@@ -712,6 +713,7 @@ def build_parser():
     parser.add_argument("--codebook-weight", type=float, default=1.0, help="codebook loss weight for vector quantization")
     parser.add_argument("--entropy-loss-ratio", type=float, default=0.0, help="entropy loss ratio in codebook loss")
     parser.add_argument("--vq-loss-ratio", type=float, default=1.0, help="vq loss ratio in codebook loss")
+    parser.add_argument("--quantizer-type", type=str, default="vq", choices=["vq", "simvq"], help="Quantizer backend for VQ (vector or sim).")
     parser.add_argument("--commit-loss-beta", type=float, default=0.25, help="commit loss beta in codebook loss")
     parser.add_argument("--reconstruction-weight", type=float, default=1.0, help="reconstruction loss weight of image pixel")
     parser.add_argument("--reconstruction-loss", type=str, default='l2', help="reconstruction loss type of image pixel")

@@ -48,6 +48,7 @@ class ModelArgs:
     codebook_show_usage: bool = True
     commit_loss_beta: float = 0.25
     entropy_loss_ratio: float = 0.0
+    quantizer_type: str = "vq"
     vq_loss_ratio: float = 1.0 # for soft vq
     kl_loss_weight: float = 0.000001
     tau: float = 0.1
@@ -550,6 +551,7 @@ class VFMTokModel(nn.Module, PyTorchModelHubMixin):
             codebook_show_usage=config.codebook_show_usage,
             commit_loss_beta=config.commit_loss_beta,
             entropy_loss_ratio=config.entropy_loss_ratio,
+            quantizer_type=config.quantizer_type,
             encoder_ch_mult=config.encoder_ch_mult,
             decoder_ch_mult=config.decoder_ch_mult,
             z_channels=config.z_channels,
