@@ -88,3 +88,13 @@ class TimmEmbedder(nn.Module):
             feats[-1] = self.model.norm(feats[-1])
 
         return feats
+
+    @torch.no_grad()
+    def pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the SigLIP head pooling (attn pool + fc_norm + head_drop) to a token sequence.
+        """
+        vit = self.model
+        dtype = vit.pos_embed.dtype if hasattr(vit, "pos_embed") else tokens.dtype
+        tokens = tokens.to(dtype=dtype)
+        return vit.forward_head(tokens)

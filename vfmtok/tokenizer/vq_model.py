@@ -422,7 +422,7 @@ class VectorQuantizer(nn.Module):
         if self.l2_norm:
             self.embedding.weight.data = F.normalize(self.embedding.weight.data, p=2, dim=-1)
         if self.show_usage:
-            self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536)))
+            self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536*2)))
 
     
     def forward(self, z):

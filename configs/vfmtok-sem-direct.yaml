@@ -49,6 +49,14 @@ decoder_patch_size: 16
 decoder_tuning_method: full
 decoder_up_type: semantic
 num_latent_tokens: 128
+semantic_zs: True
+semantic_zs_classnames: imagenet_classnames.txt
+semantic_zs_openclip_model: ViT-L-16-SigLIP2-384
+semantic_zs_openclip_pretrained: ./weights/siglip2_openclip/open_clip_model.safetensors
+semantic_zs_tokenizer_dir: ./weights/siglip2_openclip
+semantic_zs_templates:
+  - "a photo of a {}"
+semantic_zs_pooling: siglip
 
 repa: False
 repa_proj_dim: 1024

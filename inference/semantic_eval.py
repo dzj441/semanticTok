@@ -1,12 +1,11 @@
-import argparse
 import os
 import sys
-sys.path.append(os.getcwd())
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from pathlib import Path
 from PIL import Image
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import transforms
@@ -15,12 +14,34 @@ from tqdm import tqdm
 
 from skimage.metrics import peak_signal_noise_ratio as psnr_loss
 from skimage.metrics import structural_similarity as ssim_loss
+from torchmetrics.image.fid import FrechetInceptionDistance
 
+sys.path.append(os.getcwd())
 from modelling.tokenizer import VQ_models
 from train.train_tokenizer import build_parser
 from utils.data import center_crop_arr
-from utils.misc import load_model_state_dict, str2bool
-from torchmetrics.image.fid import FrechetInceptionDistance
+from utils.misc import load_model_state_dict
+
+
+# ========================
+# 全局配置（按需修改）
+# ========================
+CONFIG_PATH = "configs/simvq-bl-128-eval.yaml"
+WEIGHTS_PATH = "weights/model.pth"
+DEVICE = None  # None -> 自动选择
+DISTRIBUTED = False
+PER_PROC_BATCH_SIZE = None
+BATCH_SIZE = 32
+GLOBAL_BATCH_SIZE = None
+GLOBAL_SEED = None
+NUM_WORKERS = None
+SAVE_PNG = False
+SAMPLE_DIR = "semantic_eval_samples"
+NPZ_COUNT = 50000
+COMPUTE_FID = True
+FID_WEIGHTS_PATH = "weights/weights-inception-2015-12-05-6726825d.pth"
+DATA_PATH_OVERRIDE = None
+EVAL_DATA_PATH_OVERRIDE = None
 
 
 def build_npz_from_folder(folder: str, limit: int = 50000):
@@ -44,27 +65,43 @@ def build_npz_from_folder(folder: str, limit: int = 50000):
     print(f"[Eval] Saved NPZ with {arr.shape[0]} samples to {out_path}")
 
 
-def parse_args():
+def load_eval_args():
     parser = build_parser()
-    parser.add_argument("--weights", type=str, default="weights/model.pth", help="Path to model-only weights (.pth).")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--per-proc-batch-size", type=int, default=None, help="Batch size per process when running DDP eval.")
-    parser.add_argument("--distributed", type=str2bool, default=False, help="Enable distributed evaluation (NCCL).")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--save-png", type=str2bool, default=False, help="Whether to persist reconstructed images as .png files.")
-    parser.add_argument("--sample-dir", type=str, default="eval_samples", help="Directory to store reconstructed png samples when --save-png is enabled.")
-    parser.add_argument("--npz-count", type=int, default=50000, help="Number of samples to pack into the exported .npz if --save-png is enabled.")
-    parser.add_argument("--fid", type=str2bool, default=True, help="Compute FID (requires torchmetrics weights file).")
-    parser.add_argument("--fid-weights", type=str, default="weights/weights-inception-2015-12-05-6726825d.pth", help="Path to Inception weights for FID.")
 
-    args = parser.parse_args()
-    if args.config and os.path.isfile(args.config):
+    if CONFIG_PATH:
+        if not os.path.isfile(CONFIG_PATH):
+            raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
         from ruamel import yaml
-        with open(args.config, 'r', encoding='utf-8') as f:
+
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             file_yaml = yaml.YAML()
             config_args = file_yaml.load(f)
             parser.set_defaults(**(config_args or {}))
-        args = parser.parse_args()
+
+    args = parser.parse_args([])
+
+    args.config = CONFIG_PATH
+    args.weights = WEIGHTS_PATH
+    args.device = DEVICE
+    args.distributed = DISTRIBUTED
+    args.per_proc_batch_size = PER_PROC_BATCH_SIZE
+    if BATCH_SIZE is not None:
+        args.batch_size = BATCH_SIZE
+    if GLOBAL_BATCH_SIZE is not None:
+        args.global_batch_size = GLOBAL_BATCH_SIZE
+    if GLOBAL_SEED is not None:
+        args.global_seed = GLOBAL_SEED
+    if NUM_WORKERS is not None:
+        args.num_workers = NUM_WORKERS
+    args.save_png = SAVE_PNG
+    args.sample_dir = SAMPLE_DIR
+    args.npz_count = NPZ_COUNT
+    args.fid = COMPUTE_FID
+    args.fid_weights = FID_WEIGHTS_PATH
+    if DATA_PATH_OVERRIDE is not None:
+        args.data_path = DATA_PATH_OVERRIDE
+    if EVAL_DATA_PATH_OVERRIDE is not None:
+        args.eval_data_path = EVAL_DATA_PATH_OVERRIDE
     return args
 
 
@@ -102,24 +139,21 @@ def build_model(args, device):
         repa_loss_weight=args.repa_loss_weight,
         repa_align=args.repa_align,
         num_codebooks=args.num_codebooks,
-        # encoder mask modeling
         enc_token_drop=args.enc_token_drop,
         enc_token_drop_max=args.enc_token_drop_max,
         cls_recon=args.cls_recon,
         cls_recon_weight=args.cls_recon_weight,
         semantic_target_layers=args.semantic_target_layers,
         semantic_qam_layers=args.semantic_qam_layers,
-        # aux decoder model
         aux_dec_model=args.aux_decoder_model,
         aux_loss_mask=args.aux_loss_mask,
         aux_hog_dec=args.aux_hog_decoder,
         aux_dino_dec=args.aux_dino_decoder,
         aux_clip_dec=args.aux_clip_decoder,
         aux_supcls_dec=args.aux_supcls_decoder,
-        # to pixel
         to_pixel=args.to_pixel,
         transformer_config=args.transformer_config,
-        codebook_slots_embed_dim=args.codebook_slots_embed_dim,    
+        codebook_slots_embed_dim=args.codebook_slots_embed_dim,
     ).to(device)
     model.eval()
     return model
@@ -138,11 +172,13 @@ def load_model_weights(model, weights_path):
 
 def build_dataloader(args, distributed=False, world_size=1, rank=0):
     eval_root = args.eval_data_path if args.eval_data_path else args.data_path
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.Lambda(lambda img: center_crop_arr(img, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+        ]
+    )
     dataset = ImageFolder(eval_root, transform=transform)
     if distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -155,13 +191,19 @@ def build_dataloader(args, distributed=False, world_size=1, rank=0):
     else:
         sampler = None
         batch_size = args.batch_size or args.global_batch_size
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
     return loader, len(dataset), sampler
 
 
-def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1,
-             fid_metric=None, save_png=False, sample_dir=None):
+def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1, fid_metric=None, save_png=False, sample_dir=None):
     mse_sum = 0.0
     l1_sum = 0.0
     total_count = 0
@@ -178,8 +220,8 @@ def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1,
             recon, _, _ = model(images)
 
         batch_size = images.size(0)
-        mse = F.mse_loss(recon, images, reduction='mean').item()
-        l1 = F.l1_loss(recon, images, reduction='mean').item()
+        mse = F.mse_loss(recon, images, reduction="mean").item()
+        l1 = F.l1_loss(recon, images, reduction="mean").item()
         mse_sum += mse * batch_size
         l1_sum += l1 * batch_size
         total_count += batch_size
@@ -194,7 +236,7 @@ def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1,
 
         if fid_metric is not None:
             real_uint8 = torch.clamp(images * 127.5 + 128, 0, 255).round().to(torch.uint8)
-            fake_uint8 = torch.clamp(recon  * 127.5 + 128, 0, 255).round().to(torch.uint8)
+            fake_uint8 = torch.clamp(recon * 127.5 + 128, 0, 255).round().to(torch.uint8)
             fid_metric.update(real_uint8, real=True)
             fid_metric.update(fake_uint8, real=False)
 
@@ -206,8 +248,11 @@ def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1,
                 next_png_index += world_size
 
     if distributed:
-        stats = torch.tensor([mse_sum, l1_sum, psnr_sum, ssim_sum, float(total_count), float(psnr_count)],
-                             device=device, dtype=torch.float64)
+        stats = torch.tensor(
+            [mse_sum, l1_sum, psnr_sum, ssim_sum, float(total_count), float(psnr_count)],
+            device=device,
+            dtype=torch.float64,
+        )
         dist.all_reduce(stats)
         mse_sum, l1_sum, psnr_sum, ssim_sum, total_count, psnr_count = stats.tolist()
     metrics = {
@@ -225,7 +270,7 @@ def evaluate(model, loader, device, *, distributed=False, rank=0, world_size=1,
 
 
 def main():
-    args = parse_args()
+    args = load_eval_args()
 
     distributed = args.distributed
     rank = 0
@@ -275,15 +320,23 @@ def main():
         if distributed:
             dist.barrier()
 
-    metrics = evaluate(model, loader, device, distributed=distributed, rank=rank, world_size=world_size,
-                       save_png=args.save_png, sample_dir=args.sample_dir,
-                       fid_metric=fid_metric)
+    metrics = evaluate(
+        model,
+        loader,
+        device,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        save_png=args.save_png,
+        sample_dir=args.sample_dir,
+        fid_metric=fid_metric,
+    )
 
     if distributed:
         dist.barrier()
 
     if (not distributed) or (rank == 0):
-        print("========== Evaluation Summary ==========")
+        print("========== Semantic Evaluation Summary ==========")
         print(f"Dataset size: {dataset_len}")
         for k, v in metrics.items():
             print(f"{k}: {v:.6f}")

@@ -254,11 +254,17 @@ class SemanticEvaluator:
         enable_codebook_usage_measure: bool = False,
         enable_codebook_entropy_measure: bool = False,
         num_codebook_entries: int = 1024,
+        text_embeddings: Optional[torch.Tensor] = None,
+        logit_scale: float = 1.0,
+        logit_bias: float = 0.0,
     ):
         self._device = device
         self._enable_codebook_usage_measure = enable_codebook_usage_measure
         self._enable_codebook_entropy_measure = enable_codebook_entropy_measure
         self._num_codebook_entries = num_codebook_entries
+        self._text_embs = text_embeddings  # should already be on device
+        self._logit_scale = logit_scale
+        self._logit_bias = logit_bias
         self.reset_metrics()
 
     def reset_metrics(self):
@@ -266,12 +272,22 @@ class SemanticEvaluator:
         self._cos_sum = 0.0
         self._l1_sum = 0.0
         self._l2_sum = 0.0
+        self._zs_top1 = 0
+        self._zs_top5 = 0
+        self._zs_total = 0
         self._set_of_codebook_indices = set()
         self._codebook_frequencies = torch.zeros(
             (self._num_codebook_entries), dtype=torch.float64, device=self._device
         )
 
-    def update(self, teacher_sem: torch.Tensor, pred_sem: torch.Tensor, codebook_indices: Optional[torch.Tensor] = None):
+    def update(
+        self,
+        teacher_sem: torch.Tensor,
+        pred_sem: torch.Tensor,
+        codebook_indices: Optional[torch.Tensor] = None,
+        zero_shot_emb: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ):
         if teacher_sem.shape != pred_sem.shape:
             raise ValueError(
                 f"Teacher/pred semantic feature shapes mismatch: {teacher_sem.shape} vs {pred_sem.shape}"
@@ -298,6 +314,22 @@ class SemanticEvaluator:
             entries, counts = torch.unique(codebook_indices, sorted=False, return_counts=True)
             self._codebook_frequencies.index_add_(0, entries.int(), counts.double())
 
+        if (
+            self._text_embs is not None
+            and zero_shot_emb is not None
+            and labels is not None
+        ):
+            embeddings = F.normalize(zero_shot_emb.to(self._device), dim=-1)
+            logits = embeddings @ self._text_embs.t()
+            logits = logits * self._logit_scale + self._logit_bias
+            max_k = min(5, logits.size(1))
+            _, preds = logits.topk(max_k, dim=1, largest=True, sorted=True)
+            labels = labels.view(-1, 1).to(self._device)
+            correct = preds.eq(labels.expand_as(preds))
+            self._zs_top1 += correct[:, :1].sum().item()
+            self._zs_top5 += correct[:, :max_k].sum().item()
+            self._zs_total += labels.size(0)
+
     def result(self) -> Mapping[Text, float]:
         if self._num_examples == 0:
             raise ValueError("No semantic examples to evaluate.")
@@ -306,6 +338,9 @@ class SemanticEvaluator:
             "rL1": self._l1_sum / self._num_examples,
             "rL2": self._l2_sum / self._num_examples,
         }
+        if self._zs_total > 0:
+            eval_score["ZSTop1"] = self._zs_top1 / self._zs_total * 100.0
+            eval_score["ZSTop5"] = self._zs_top5 / self._zs_total * 100.0
 
         if self._enable_codebook_usage_measure:
             usage = float(len(self._set_of_codebook_indices)) / self._num_codebook_entries

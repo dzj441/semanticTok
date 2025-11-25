@@ -30,6 +30,7 @@ import time
 import argparse
 from glob import glob
 from copy import deepcopy
+from typing import Optional, Callable
 
 from timm.scheduler import create_scheduler_v2 as create_scheduler
 from evaluator import VQGANEvaluator, SemanticEvaluator
@@ -42,15 +43,38 @@ from utils.optim import param_groups_weight_decay
 from utils.data import random_crop_arr, center_crop_arr
 from modelling.tokenizer import VQ_models
 from losses.vq_loss import VQLoss, SemVQLoss
+from utils.zeroshot import prepare_text_embeddings
 
 def seed_everything(TORCH_SEED):
-	random.seed(TORCH_SEED)
-	os.environ['PYTHONHASHSEED'] = str(TORCH_SEED)
-	np.random.seed(TORCH_SEED)
-	torch.manual_seed(TORCH_SEED)
-	torch.cuda.manual_seed_all(TORCH_SEED)
-	torch.backends.cudnn.deterministic = True
-	torch.backends.cudnn.benchmark = False
+    random.seed(TORCH_SEED)
+    os.environ['PYTHONHASHSEED'] = str(TORCH_SEED)
+    np.random.seed(TORCH_SEED)
+    torch.manual_seed(TORCH_SEED)
+    torch.cuda.manual_seed_all(TORCH_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def resolve_semantic_pool_fn(vq_model):
+    encoder = getattr(vq_model.model, "encode_transformer", None)
+    if encoder is not None and hasattr(encoder, "pool_tokens"):
+        return encoder.pool_tokens
+    raise AttributeError("Current VQ model does not expose pool_tokens on its encoder.")
+
+def pool_semantic_tokens(sem_preds: torch.Tensor, method: str = "mean", pool_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None):
+    if sem_preds.dim() == 3:
+        if method == "mean":
+            pooled = sem_preds.mean(dim=1)
+        elif method == "cls":
+            pooled = sem_preds[:, 0, :]
+        elif method == "siglip":
+            if pool_fn is None:
+                raise ValueError("SigLIP pooling requires a valid pooling function.")
+            pooled = pool_fn(sem_preds)
+        else:
+            raise ValueError(f"Unknown semantic pooling method '{method}'")
+    else:
+        pooled = sem_preds
+    return pooled
 
 ## online Eval 
 @torch.no_grad()
@@ -97,22 +121,27 @@ def run_eval(step, model_for_eval, ptdtype,
 def run_semantic_eval(step, model_for_eval, ptdtype,
                       eval_loader,
                       evaluator,
-                      logger, wandb_logger, device):
+                      logger, wandb_logger, device,
+                      pooling: str = "mean",
+                      pool_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None):
     was_training = model_for_eval.training
     model_for_eval.eval()
     evaluator.reset_metrics()
-    for images, _ in eval_loader:
+    for images, labels in eval_loader:
+        print(labels)
         images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         with torch.cuda.amp.autocast(dtype=ptdtype):
             sem_preds, _, info = model_for_eval(images)
         teacher_sem = info[0]
         if teacher_sem is None:
             raise RuntimeError("Semantic evaluator requires teacher semantic features (info[0]).")
         codebook_indices = info[2].flatten() if len(info) > 2 else None
-        evaluator.update(teacher_sem, sem_preds, codebook_indices)
+        zero_shot_emb = pool_semantic_tokens(sem_preds, method=pooling, pool_fn=pool_fn)
+        evaluator.update(teacher_sem, sem_preds, codebook_indices, zero_shot_emb=zero_shot_emb, labels=labels)
     scores = evaluator.result()
     parts = [f"[Semantic Eval] step={step}"]
-    for key in ["rCosine", "rL1", "rL2", "CodebookUsage", "CodebookEntropy"]:
+    for key in ["rCosine", "rL1", "rL2", "ZSTop1", "ZSTop5", "CodebookUsage", "CodebookEntropy"]:
         if key in scores:
             parts.append(f"{key}={scores[key]:.4f}")
     logger.info(" | ".join(parts))
@@ -233,6 +262,40 @@ def main(args):
     )
     logger.info(f"VQ Model Structure:\n{vq_model}")
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters() if p.requires_grad):,}")
+
+    text_embeddings = None
+    logit_scale = 1.0
+    logit_bias = 0.0
+    semantic_pool_fn = None
+    if use_semantic_loss and args.semantic_zs:
+        if not all(
+            [
+                args.semantic_zs_classnames,
+                args.semantic_zs_openclip_pretrained,
+                args.semantic_zs_tokenizer_dir,
+            ]
+        ):
+            raise ValueError("Semantic zero-shot evaluation requires classnames, pretrained checkpoint, and tokenizer dir.")
+        text_embeddings, logit_scale, logit_bias, classnames = prepare_text_embeddings(
+            args.semantic_zs_openclip_model,
+            args.semantic_zs_openclip_pretrained,
+            args.semantic_zs_tokenizer_dir,
+            args.semantic_zs_classnames,
+            device,
+            args.semantic_zs_templates,
+        )
+        logger.info(
+            "Semantic zero-shot eval enabled with %s (%d classes).",
+            args.semantic_zs_openclip_model,
+            len(classnames),
+        )
+        if args.semantic_zs_pooling.lower() == "siglip":
+            semantic_pool_fn = resolve_semantic_pool_fn(vq_model)
+            if semantic_pool_fn is None:
+                raise ValueError("Current VQ model does not expose a SigLIP pooling head.")
+            logger.info("Using encoder's SigLIP pooling head for zero-shot evaluation.")
+    else:
+        classnames = None
     if args.ema:
         ema = deepcopy(vq_model).to(device)  # Create an EMA of the model for use after training
         requires_grad(ema, False)
@@ -327,6 +390,8 @@ def main(args):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
         eval_dataset = ImageFolder(eval_root, transform=eval_transform)
+        if classnames is not None and len(classnames) != len(eval_dataset.classes):
+            raise ValueError(f"Classnames file has {len(classnames)} entries but dataset has {len(eval_dataset.classes)} classes.")
 
         eval_bs = int(args.global_batch_size // dist.get_world_size())  # 复用“每卡”训练 batch
         eval_loader = DataLoader(
@@ -359,6 +424,9 @@ def main(args):
             enable_codebook_usage_measure=True,
             enable_codebook_entropy_measure=True,
             num_codebook_entries=args.codebook_size,
+            text_embeddings=text_embeddings,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
         )
         logger.info("Successfully create semantic evaluator")
 
@@ -563,7 +631,9 @@ def main(args):
                             evaluator=semantic_evaluator,
                             logger=logger,
                             wandb_logger=wandb_logger,
-                            device=device
+                            device=device,
+                            pooling=args.semantic_zs_pooling,
+                            pool_fn=semantic_pool_fn
                         )
                     elif (not use_semantic_loss) and (evaluator is not None):
                         logger.info(f"(step={train_steps:07d}/total_steps:{max_train_steps:07d}) start Evaluation")
@@ -615,7 +685,7 @@ def main(args):
     if rank == 0 and (eval_loader is not None):
         model_for_eval = ema if args.ema else (vq_model.module._orig_mod if args.compile else vq_model.module)
         if use_semantic_loss and semantic_evaluator is not None:
-            run_semantic_eval(train_steps, model_for_eval, ptdtype, eval_loader, semantic_evaluator, logger, wandb_logger, device)
+            run_semantic_eval(train_steps, model_for_eval, ptdtype, eval_loader, semantic_evaluator, logger, wandb_logger, device, pooling=args.semantic_zs_pooling, pool_fn=semantic_pool_fn)
         elif (not use_semantic_loss) and (evaluator is not None):
             run_eval(train_steps, model_for_eval, ptdtype, eval_loader, evaluator, logger, wandb_logger, device)
     logger.info("Done!")
@@ -656,6 +726,13 @@ def build_parser():
                         choices=["cnn", "linear"], help="Upsampling head used inside VFMTok decoder")
     parser.add_argument("--z-channels", type=int, default=512,
                         help="Latent channel dimension (bottleneck channels) for encoder/decoder")
+    parser.add_argument("--semantic-zs", type=str2bool, default=False, help="Enable semantic zero-shot evaluation")
+    parser.add_argument("--semantic-zs-classnames", type=str, default="", help="Path to classnames txt file for zero-shot eval")
+    parser.add_argument("--semantic-zs-openclip-model", type=str, default="ViT-L-16-SigLIP2-384", help="open_clip text model name")
+    parser.add_argument("--semantic-zs-openclip-pretrained", type=str, default="", help="Path or identifier for open_clip pretrained weights")
+    parser.add_argument("--semantic-zs-tokenizer-dir", type=str, default="", help="Directory containing open_clip tokenizer files")
+    parser.add_argument("--semantic-zs-templates", type=str, nargs='*', default=["a photo of a {}"], help="Prompt templates for zero-shot text embeddings")
+    parser.add_argument("--semantic-zs-pooling", type=str, default="mean", choices=["mean", "cls", "siglip"], help="Pooling method to derive embedding from semantic tokens")
     
     parser.add_argument("--perceptual-weight", type=float, default=1.0, help="perceptual loss weight of LPIPS")
     parser.add_argument("--perceptual-loss", type=str, default='vgg', help="perceptual loss type of LPIPS", choices=['vgg', 'timm', 'tv'])

@@ -51,6 +51,11 @@ class DirectFeatureEncoder(nn.Module):
             slots = rearrange(slots, "b c h w -> b (h w) c")
         return slots, latent
 
+    def pool_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.backbone, "pool_tokens"):
+            return self.backbone.pool_tokens(tokens)
+        raise RuntimeError("Backbone does not expose pooling capability.")
+
 
 class DirectSemanticDecoder(nn.Module):
     """
@@ -402,6 +407,138 @@ class Decoder(nn.Module):
             return z, dinov2
         else:
             return z, None
+
+
+class SemFirstPixelNextDecoder(nn.Module):
+    def __init__(self, layer_type, image_size, patch_size, dim, n_carrier, depth,
+                 num_head, mlp_dim, dim_head=64, dropout=0., num_register_tokens=4,):
+        
+        super().__init__()
+        
+        self.image_size = image_size
+        self.patch_size = patch_size
+        assert image_size % patch_size == 0, 'Image dimensions must be divisible by the patch size.'
+
+        self.dim = dim
+        scale = dim ** -0.5
+        self.num_patches = (image_size // patch_size) ** 2
+        self.num_tokens = 1
+        self.num_register_tokens = num_register_tokens
+
+        self.position_embedding = nn.Parameter(torch.randn(1, 576 + 1, dim) * scale)
+        self.slot_position_embedding = nn.Parameter(torch.randn(1, n_carrier, dim) * scale)
+
+        self.mask_embedding = nn.Parameter(torch.randn(1, 1, dim) * scale)
+        self.mask_dino = nn.Parameter(torch.randn(1, 1, dim) * scale)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * scale)
+
+        self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
+
+        self.transformer = Transformer(layer_type, dim, depth, num_head, dim_head, mlp_dim, dropout, xformer=False)
+        
+        self.norm_post1 = nn.LayerNorm(dim)
+        self.norm_post2 = nn.LayerNorm(dim)
+        self.proj = nn.Linear(dim, 1024)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def interpolate_pos_encoding(self, x, w, h):
+
+        npatch = w * h
+        N = self.position_embedding.size(1) - 1
+        if npatch == N and w == h:
+            return self.position_embedding
+
+        class_pos_embed = self.position_embedding[:, :1]
+        patch_pos_embed = self.position_embedding[:, 1:]
+        dim = x.shape[2]
+        
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        w0, h0 = w + 0.1, h + 0.1
+
+        m = patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2)
+        patch_pos_embed = F.interpolate(
+            patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
+            scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
+            mode='bicubic',
+        )
+
+        assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
+        # return patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        pos_embed = torch.cat((class_pos_embed, patch_pos_embed.flatten(2).transpose(1, 2)), dim=1)
+        
+        return pos_embed
+
+    def prepare_tokens(self, x):
+
+        w = h = int(math.sqrt(x.size(1)))
+        # add positional encoding to each token
+        x = x + self.interpolate_pos_encoding(x, w, h)
+        
+        return x
+    
+    def single_forward(self, conds, z, norm, reshape=False):
+
+        bs, n_c, _ = conds.shape
+        num_patches = z.size(1) # cls + mask + register
+        H = W = int(math.sqrt(num_patches))
+        
+        x = torch.cat((self.norm_post1(conds), norm(z)), dim=1) # latents cls mask register
+        mask = ~torch.tril(x.new_ones((n_c + num_patches, n_c + num_patches), dtype=torch.bool), diagonal=0)
+        
+        x = self.transformer(x, mask=mask)
+        if reshape:
+            z = rearrange(x[:, n_c + self.num_tokens:n_c + num_patches-self.num_register_tokens], 'b (h w) c -> b c h w', h=H, w=W)
+        else:
+            z = x[:, n_c + self.num_tokens:n_c + num_patches-self.num_register_tokens]
+        return z
+    
+    def forward(self, slots):
+
+        bs = slots.size(0)
+        memory = slots + self.slot_position_embedding # latent
+
+        cls_token = repeat(self.cls_token, 'f ... -> (b f) ...', b=bs)
+        register_tokens = repeat(self.register_tokens, 'f ... -> (b f) ...', b=bs)
+
+        # semantic tokens (DINO) from slots
+        semantic_mask = self.mask_dino + self.position_embedding[:, 1:]
+        semantic_mask = repeat(semantic_mask, 'f ... -> (b f) ...', b=bs)
+        semantic_tokens = torch.cat(
+            (cls_token + self.position_embedding[:, :1], semantic_mask, register_tokens),
+            dim=1,
+        )
+        semantic_tokens = self.single_forward(memory, semantic_tokens, self.norm_post2, False)
+
+        # convert semantic tokens to pixel feature map
+        B, N, C = semantic_tokens.shape
+        H_sem = int(math.sqrt(N))
+        z = semantic_tokens.reshape(B, H_sem, H_sem, C).permute(0, 3, 1, 2).contiguous()
+        target = int(math.sqrt(self.num_patches))
+        if H_sem != target:
+            z = F.interpolate(z, size=(target, target), mode='bilinear', align_corners=False)
+
+
+        if self.training:
+            dinov2 = self.proj(semantic_tokens)
+            return z, dinov2
+        else:
+            return z,None
 
 def _get_clones(module, N):
 
