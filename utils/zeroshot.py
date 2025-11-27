@@ -6,16 +6,10 @@ import torch.nn.functional as F
 
 import open_clip
 from open_clip.tokenizer import HFTokenizer
+from open_clip import IMAGENET_CLASSNAMES
 
-
-def load_classnames(path: str) -> List[str]:
-    names: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            name = line.strip()
-            if name:
-                names.append(name)
-    return names
+def load_classnames() -> List[str]:
+    return IMAGENET_CLASSNAMES
 
 
 def build_text_embeddings(
@@ -62,13 +56,9 @@ def prepare_text_embeddings(
     model_name: str,
     pretrained: str,
     tokenizer_dir: str,
-    classnames_file: str,
     device: torch.device,
     templates: Sequence[str],
 ):
-    if not os.path.isfile(classnames_file):
-        raise FileNotFoundError(f"Classnames file not found: {classnames_file}")
-
     vl_model, _, _ = open_clip.create_model_and_transforms(
         model_name,
         pretrained=pretrained,
@@ -76,7 +66,7 @@ def prepare_text_embeddings(
     )
     vl_model.eval()
     tokenizer = HFTokenizer(tokenizer_dir, context_length=vl_model.context_length)
-    classnames = load_classnames(classnames_file)
+    classnames = load_classnames()
 
     text_embs = build_text_embeddings(
         classnames,

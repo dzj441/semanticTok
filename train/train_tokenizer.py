@@ -128,7 +128,6 @@ def run_semantic_eval(step, model_for_eval, ptdtype,
     model_for_eval.eval()
     evaluator.reset_metrics()
     for images, labels in eval_loader:
-        print(labels)
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         with torch.cuda.amp.autocast(dtype=ptdtype):
@@ -271,7 +270,6 @@ def main(args):
     if use_semantic_loss and args.semantic_zs:
         if not all(
             [
-                args.semantic_zs_classnames,
                 args.semantic_zs_openclip_pretrained,
                 args.semantic_zs_tokenizer_dir,
             ]
@@ -281,7 +279,6 @@ def main(args):
             args.semantic_zs_openclip_model,
             args.semantic_zs_openclip_pretrained,
             args.semantic_zs_tokenizer_dir,
-            args.semantic_zs_classnames,
             device,
             args.semantic_zs_templates,
         )
@@ -729,7 +726,7 @@ def build_parser():
     parser.add_argument("--z-channels", type=int, default=512,
                         help="Latent channel dimension (bottleneck channels) for encoder/decoder")
     parser.add_argument("--semantic-zs", type=str2bool, default=False, help="Enable semantic zero-shot evaluation")
-    parser.add_argument("--semantic-zs-classnames", type=str, default="", help="Path to classnames txt file for zero-shot eval")
+    parser.add_argument("--semantic-zs-classnames", type=str, default="", help="Path to classnames txt file for zero-shot eval;not used now")
     parser.add_argument("--semantic-zs-openclip-model", type=str, default="ViT-L-16-SigLIP2-384", help="open_clip text model name")
     parser.add_argument("--semantic-zs-openclip-pretrained", type=str, default="", help="Path or identifier for open_clip pretrained weights")
     parser.add_argument("--semantic-zs-tokenizer-dir", type=str, default="", help="Directory containing open_clip tokenizer files")
