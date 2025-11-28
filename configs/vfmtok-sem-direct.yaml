@@ -66,9 +66,9 @@ repa_align: repeat
 cls_recon: False
 cls_recon_weight: 0.0
 
-transformer_config: configs/vfmtok-direct.yaml
+transformer_config: configs/vfmtok_transformer-tradeoff.yaml
 codebook_slots_embed_dim: 64
-z_channels: 1024
+z_channels: 4096 # 4096 for pixel shuffle
 
 epochs: 50
 lr: 1.0e-4
@@ -78,4 +78,4 @@ weight_decay: 5e-2
 beta1: 0.9
 beta2: 0.95
 max_grad_norm: 1.0
-global_batch_size: 512
+global_batch_size: 2

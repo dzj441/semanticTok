@@ -1,0 +1,48 @@
+encoder_config:
+  target: vfmtok.core.layers.DirectFeatureEncoder
+  params:
+    image_size: 256
+    patch_size: 16
+    dim: 1024
+    encoder_variant: direct
+    visual_encoder_config:
+      target: vfmtok.modules.encoders.pretrained_enc_arch_timm.TimmEmbedder
+      is_trainable: False
+      params:
+        model_name: vit_large_patch16_siglip_384.v2_webli
+        pretrained: True
+        img_size: 384
+        patch_size: 16
+        feature_levels: [23]
+        ckpt_path: ./weights/vit_large_patch16_siglip_384.v2_webli/model.safetensors
+decoder_config:
+  target: vfmtok.core.layers.DirectSemanticDecoder
+  params:
+    layer_type: normal
+    image_size: 384
+    patch_size: 16
+    dim: 1024
+    depth: 6
+    num_head: 8
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    n_carrier: 576
+    num_register_tokens: 4
+    semantic_dim: 1024
+tradeoff_block_config:
+  target: vfmtok.tokenizer.downsampling.SpatialChannelTradeOffBlock
+  params:
+    token_length: 576
+    embed_dim: 1024
+    factor: 2
+    method: pixel
+    split_channels: False
+inverse_tradeoff_block_config:
+  target: vfmtok.tokenizer.downsampling.SpatialChannelTradeOffInverse
+  params:
+    token_length: 576
+    embed_dim: 1024
+    factor: 2
+    method: pixel
+    split_channels: False

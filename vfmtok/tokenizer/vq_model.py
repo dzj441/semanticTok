@@ -4,7 +4,7 @@
 import torch, pdb
 import torch.nn as nn
 import os.path as osp
-from typing import List
+from typing import List, Optional
 from copy import deepcopy
 from einops import rearrange
 import torch.nn.functional as F
@@ -194,6 +194,18 @@ class VQModel(nn.Module):
 
         self.encode_transformer = instantiate_from_config(config.transformer_config.encoder_config)
         self.decode_transformer = instantiate_from_config(config.transformer_config.decoder_config)
+        self.tradeoff_block = (
+            instantiate_from_config(config.transformer_config.tradeoff_block_config)
+            if config.transformer_config.tradeoff_block_config is not None
+            else None
+        )
+        self.inverse_tradeoff_block = (
+            instantiate_from_config(config.transformer_config.inverse_tradeoff_block_config)
+            if config.transformer_config.inverse_tradeoff_block_config is not None
+            else None
+        )
+        if (self.tradeoff_block is None) ^ (self.inverse_tradeoff_block is None):
+            raise ValueError("tradeoff_block_config and inverse_tradeoff_block_config must be both set or both None.")
 
         quantizer_type = getattr(config, "quantizer_type", "vq").lower()
         if quantizer_type == "vq":
@@ -227,6 +239,8 @@ class VQModel(nn.Module):
     def encode(self, x):
 
         slots, latent = self.encode_transformer(x,)
+        if self.tradeoff_block is not None:
+            slots = self.tradeoff_block(slots)
         queries = self.pre_slots_quant(slots)
         queries = rearrange(queries.unsqueeze(2), 'b h w c -> b c h w')
         quant2, emb_loss, (_, _, q_indices) = self.slot_quantize(queries)
@@ -267,7 +281,8 @@ class VQModel(nn.Module):
     def decode(self, slots):
         
         queries = self.post_slots_quant(slots)
-
+        if self.inverse_tradeoff_block is not None:
+            queries = self.inverse_tradeoff_block(queries)
         z, dinov2 = self.decode_transformer(queries)
         dec = self.decoder(z)
         return dec, dinov2
@@ -281,7 +296,6 @@ class VQModel(nn.Module):
     def forward(self, input):
 
         (quant, latent), diff, q_indices = self.encode(input)
-
         if self.training:
             dec, dinov2 = self.decode(quant)
         else:
