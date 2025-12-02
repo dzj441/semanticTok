@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings('ignore', message='Overwriting.*in registry')
+
 import argparse
 import os
 import sys
@@ -15,7 +18,7 @@ from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
 import matplotlib
-
+from matplotlib.lines import Line2D
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -50,9 +53,9 @@ LATENT_SOURCES = {"latent12"}
 
 def parse_args():
     parser = build_parser()
-    parser.add_argument("--weights", type=str, default="weights/model.pth", help="Model checkpoint to load.")
-    parser.add_argument("--device", type=str, default=None, help="Device spec such as cuda:0 or cpu.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Evaluation batch size.")
+    parser.add_argument("--weights", type=str, default="weights/semtok64.pth", help="Model checkpoint to load.")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device spec such as cuda:0 or cpu.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Evaluation batch size.")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap the number of images processed.")
     parser.add_argument(
         "--feature-sources",
@@ -83,20 +86,21 @@ def parse_args():
     parser.add_argument(
         "--color-by",
         type=str,
-        default="source",
+        default="class",
         choices=["source", "class"],
         help="Color the scatter plot by feature source or dataset class.",
     )
     parser.add_argument("--marker-size", type=float, default=6.0, help="Matplotlib marker size.")
     parser.add_argument("--skip-plot", action="store_true", help="Skip plotting, only dump embeddings/metadata.")
     parser.add_argument("--skip-umap", action="store_true", help="Skip running UMAP (only saves raw features).")
-    parser.add_argument("--num-classes", type=int, default=20, help="Randomly sample this many classes (<=0 disables sampling).")
-    parser.add_argument("--samples-per-class", type=int, default=25, help="Randomly sample this many images per selected class.")
-    parser.add_argument("--sample-seed", type=int, default=None, help="Random seed for class/image sampling (defaults to --umap-seed).")
+    parser.add_argument("--num-classes", type=int, default=10, help="Randomly sample this many classes (<=0 disables sampling).")
+    parser.add_argument("--samples-per-class", type=int, default=50, help="Randomly sample this many images per selected class.")
+    parser.add_argument("--sample-seed", type=int, default=42, help="Random seed for class/image sampling (defaults to --umap-seed).")
     parser.add_argument("--global-pooling", type=str, default="siglip", choices=["siglip", "mean"], help="Pooling strategy for 1024-d features.")
     parser.add_argument("--latent-pooling", type=str, default="mean", choices=["mean"], help="Pooling for 12-d latent tokens.")
     parser.add_argument("--pca-dim", type=int, default=64, help="Apply PCA to this dimension before UMAP when > 0 and feature dim exceeds it.")
     parser.add_argument("--skip-pca", action="store_true", help="Disable PCA preprocessing before UMAP.")
+    parser.add_argument("--skip-save", action="store_true", help="Skip writing intermediate NPZ files to disk.")
 
     args = parser.parse_args()
     if args.config and os.path.isfile(args.config):
@@ -114,11 +118,13 @@ def build_model(args, device):
     ModelClass = VQ_models[args.vq_model]
     model = ModelClass(
         image_size=args.image_size,
+        z_channels=args.z_channels,
         codebook_size=args.codebook_size,
         codebook_embed_dim=args.codebook_embed_dim,
         codebook_l2_norm=args.codebook_l2_norm,
         commit_loss_beta=args.commit_loss_beta,
         entropy_loss_ratio=args.entropy_loss_ratio,
+        quantizer_type=args.quantizer_type,
         vq_loss_ratio=args.vq_loss_ratio,
         kl_loss_weight=args.kl_loss_weight,
         dropout_p=args.dropout_p,
@@ -144,17 +150,25 @@ def build_model(args, device):
         repa_loss_weight=args.repa_loss_weight,
         repa_align=args.repa_align,
         num_codebooks=args.num_codebooks,
+        # encoder mask modeling
         enc_token_drop=args.enc_token_drop,
         enc_token_drop_max=args.enc_token_drop_max,
         cls_recon=args.cls_recon,
         cls_recon_weight=args.cls_recon_weight,
+        semantic_target_layers=args.semantic_target_layers,
+        semantic_qam_layers=args.semantic_qam_layers,
+        # aux decoder model
         aux_dec_model=args.aux_decoder_model,
         aux_loss_mask=args.aux_loss_mask,
         aux_hog_dec=args.aux_hog_decoder,
         aux_dino_dec=args.aux_dino_decoder,
         aux_clip_dec=args.aux_clip_decoder,
         aux_supcls_dec=args.aux_supcls_decoder,
+        # to pixel
         to_pixel=args.to_pixel,
+        decoder_up_type=args.decoder_up_type,
+        transformer_config=args.transformer_config,
+        codebook_slots_embed_dim=args.codebook_slots_embed_dim,
     ).to(device)
     model.eval()
     return model
@@ -278,11 +292,11 @@ def collect_embeddings(model, loader, device, args, siglip_pooler=None):
     wanted = normalize_sources(args.feature_sources)
     per_source_cap = args.max_features_per_source
 
-    features = []
-    sources = []
-    image_indices = []
-    class_labels = []
-    token_indices = []
+    # 按 source 存东西
+    features_by_source = defaultdict(list)
+    image_indices_by_source = defaultdict(list)
+    class_labels_by_source = defaultdict(list)
+    token_indices_by_source = defaultdict(list)
     per_source_counts = Counter()
 
     processed = 0
@@ -330,6 +344,7 @@ def collect_embeddings(model, loader, device, args, siglip_pooler=None):
             if pooled is None:
                 continue
 
+            # pooled: [N_feat, D]
             if source_name in SIGLIP_SOURCES or source_name in LATENT_SOURCES or args.pooling == "mean":
                 img_ids = sample_ids
                 cls_ids = labels_np
@@ -343,6 +358,7 @@ def collect_embeddings(model, loader, device, args, siglip_pooler=None):
 
             pooled_np = pooled.detach().float().cpu().numpy().astype(np.float32, copy=False)
             total = pooled_np.shape[0]
+
             if per_source_cap is not None:
                 remaining_quota = per_source_cap - per_source_counts[source_name]
                 if remaining_quota <= 0:
@@ -354,28 +370,34 @@ def collect_embeddings(model, loader, device, args, siglip_pooler=None):
                     tok_ids = tok_ids[:remaining_quota]
                     total = remaining_quota
 
-            features.append(pooled_np)
-            sources.extend([source_name] * total)
-            image_indices.extend(img_ids.tolist())
-            class_labels.extend(cls_ids.tolist())
-            token_indices.extend(tok_ids.tolist())
+            # 按 source 分桶存
+            features_by_source[source_name].append(pooled_np)
+            image_indices_by_source[source_name].extend(img_ids.tolist())
+            class_labels_by_source[source_name].extend(cls_ids.tolist())
+            token_indices_by_source[source_name].extend(tok_ids.tolist())
             per_source_counts[source_name] += total
 
         if args.max_samples is not None and processed >= args.max_samples:
             break
 
-    if not features:
+    if not features_by_source:
         raise RuntimeError("No features collected. Check --feature-sources or dataset contents.")
 
-    feature_matrix = np.concatenate(features, axis=0)
-    metadata = {
-        "sources": np.array(sources, dtype=object),
-        "image_indices": np.array(image_indices, dtype=np.int64),
-        "class_labels": np.array(class_labels, dtype=np.int64),
-        "token_indices": np.array(token_indices, dtype=np.int64),
-    }
-    return feature_matrix, metadata, per_source_counts
+    # 把每个 source 的 list concat 成矩阵
+    all_features = {}
+    all_metadata = {}
+    for source_name, feat_list in features_by_source.items():
+        fm = np.concatenate(feat_list, axis=0)  # [N_src, D_src]
+        meta = {
+            "sources": np.array([source_name] * fm.shape[0], dtype=object),
+            "image_indices": np.array(image_indices_by_source[source_name], dtype=np.int64),
+            "class_labels": np.array(class_labels_by_source[source_name], dtype=np.int64),
+            "token_indices": np.array(token_indices_by_source[source_name], dtype=np.int64),
+        }
+        all_features[source_name] = fm
+        all_metadata[source_name] = meta
 
+    return all_features, all_metadata, per_source_counts
 
 def run_umap(feature_matrix, args):
     reducer = umap.UMAP(
@@ -407,28 +429,44 @@ def apply_pca(features: np.ndarray, target_dim: int):
     return reduced.astype(np.float32, copy=False), info
 
 
-def plot_embedding(embedding, metadata, args):
+def plot_embedding(embedding, metadata, args, class_names=None):
     if args.umap_components not in (2, 3):
         print(f"[UMAP] Skipping plot for {args.umap_components} components (only 2D/3D supported).")
         return
 
-    color_field = metadata["sources"] if args.color_by == "source" else metadata["class_labels"]
-    categories = sorted(set(color_field))
+    # 决定是按 source 还是按 class 上色
+    if args.color_by == "source":
+        ids = metadata["sources"]              # e.g. "siglip", "recon"
+        categories = sorted(set(ids))
+        def legend_name(cat):
+            return str(cat)
+    else:
+        ids = metadata["class_labels"]         # int class index
+        categories = sorted(set(ids))
+        def legend_name(cat):
+            if class_names is not None:
+                return str(class_names[int(cat)])   # e.g. "n01629819"
+            return str(cat)
+
+    # 推荐写法，顺便消掉 DeprecationWarning
     palette = plt.cm.get_cmap("tab20", max(len(categories), 1))
     color_map = {cat: palette(i % palette.N) for i, cat in enumerate(categories)}
 
     if args.umap_components == 2:
         fig, ax = plt.subplots(figsize=(8, 8))
+        seen = set()
         for cat in categories:
-            mask = color_field == cat
+            mask = (ids == cat)
+            label = legend_name(cat) if cat not in seen else None
             ax.scatter(
                 embedding[mask, 0],
                 embedding[mask, 1],
                 s=args.marker_size,
                 alpha=0.7,
-                label=str(cat),
+                label=label,
                 color=color_map[cat],
             )
+            seen.add(cat)
         ax.set_xlabel("UMAP-1")
         ax.set_ylabel("UMAP-2")
         ax.set_title("UMAP projection")
@@ -442,17 +480,20 @@ def plot_embedding(embedding, metadata, args):
 
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection="3d")
+        seen = set()
         for cat in categories:
-            mask = color_field == cat
+            mask = (ids == cat)
+            label = legend_name(cat) if cat not in seen else None
             ax.scatter(
                 embedding[mask, 0],
                 embedding[mask, 1],
                 embedding[mask, 2],
                 s=args.marker_size,
                 alpha=0.7,
-                label=str(cat),
+                label=label,
                 color=color_map[cat],
             )
+            seen.add(cat)
         ax.set_xlabel("UMAP-1")
         ax.set_ylabel("UMAP-2")
         ax.set_zlabel("UMAP-3")
@@ -463,6 +504,107 @@ def plot_embedding(embedding, metadata, args):
         fig.savefig(args.plot_path, dpi=300)
         plt.close(fig)
 
+def plot_combined_siglip_recon(embedding, meta_siglip, meta_recon, args,
+                               class_names=None, plot_path=None):
+    """
+    embedding: 组合后的 UMAP 结果，shape = (N_siglip + N_recon, 2)
+    meta_siglip / meta_recon: metadata_by_source["siglip"] / ["recon"]
+    颜色 = 类别，marker 形状区分 source
+    """
+    if args.umap_components != 2:
+        print("[UMAP] Combined plot currently only supports 2D UMAP.")
+        return
+
+    n_sig = len(meta_siglip["class_labels"])
+    n_rec = len(meta_recon["class_labels"])
+    assert embedding.shape[0] == n_sig + n_rec
+
+    class_labels = np.concatenate(
+        [meta_siglip["class_labels"], meta_recon["class_labels"]]
+    )
+    sources = np.array(
+        ["siglip"] * n_sig + ["recon"] * n_rec, dtype=object
+    )
+
+    categories = sorted(set(class_labels))
+    palette = plt.cm.get_cmap("tab20", max(len(categories), 1))
+    color_map = {cat: palette(i % palette.N) for i, cat in enumerate(categories)}
+
+    def class_name(cat):
+        if class_names is not None:
+            return str(class_names[int(cat)])
+        return str(cat)
+
+    marker_map = {"siglip": "o", "recon": "x"}
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    seen_classes = set()
+    for cat in categories:
+        color = color_map[cat]
+        mask_class = (class_labels == cat)
+
+        # SigLIP：空心圆 + 黑边
+        mask_sig = mask_class & (sources == "siglip")
+        label = class_name(cat) if cat not in seen_classes else None
+        if mask_sig.any():
+            ax.scatter(
+                embedding[mask_sig, 0],
+                embedding[mask_sig, 1],
+                s=args.marker_size * 1.4,
+                alpha=0.8,
+                facecolors="none",          # 空心
+                edgecolors=color,           # 用类别颜色画边
+                linewidths=1.2,
+                marker=marker_map["siglip"],
+                label=label,
+            )
+            if label is not None:
+                seen_classes.add(cat)
+
+        # recon：实心叉 + 粗线
+        mask_rec = mask_class & (sources == "recon")
+        if mask_rec.any():
+            ax.scatter(
+                embedding[mask_rec, 0],
+                embedding[mask_rec, 1],
+                s=args.marker_size * 1.4,
+                alpha=0.9,
+                color=color,                # 实心
+                marker=marker_map["recon"],
+                linewidths=1.5,
+            )
+
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.set_title("UMAP projection (siglip vs recon)")
+
+    # 颜色 legend（类）
+    class_legend = ax.legend(
+        loc="upper left", fontsize="small", markerscale=1.5, title="Classes"
+    )
+    ax.add_artist(class_legend)
+
+    # 形状 legend（source）
+    source_handles = [
+        Line2D([0], [0], marker="o", color="k", linestyle="None",
+            markerfacecolor="none", label="siglip"),
+        Line2D([0], [0], marker="x", color="k", linestyle="None",
+            label="recon"),
+    ]
+    ax.legend(
+        handles=source_handles,
+        loc="lower right",
+        fontsize="small",
+        title="Source",
+    )
+
+    fig.tight_layout()
+    if plot_path is not None:
+        Path(plot_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(plot_path, dpi=300)
+        print(f"[UMAP] Combined siglip+recon plot stored at {plot_path}")
+    plt.close(fig)
 
 def main():
     args = parse_args()
@@ -492,51 +634,119 @@ def main():
             print(f"  - {cls_idx:4d} {cls_name}: {count}")
 
     siglip_pooler = None
+    model = model.model
     encode_transformer = getattr(model, "encode_transformer", None)
     if encode_transformer is not None and hasattr(encode_transformer, "pool_tokens"):
         siglip_pooler = encode_transformer.pool_tokens
     elif args.global_pooling == "siglip":
-        print("[UMAP] Warning: SigLIP pooling requested but pool_tokens not available. Falling back to mean pooling.")
+        print("[UMAP] Warning: SigLIP pooling requested but pool_tokens not available. "
+              "Falling back to mean pooling.")
 
-    features, metadata, counters = collect_embeddings(model, loader, device, args, siglip_pooler=siglip_pooler)
-    pca_info = None
-    if (not args.skip_pca) and args.pca_dim and features.shape[1] > args.pca_dim:
-        features, pca_info = apply_pca(features, args.pca_dim)
-        print(f"[UMAP] Applied PCA to {features.shape[1]} dims (target {args.pca_dim}).")
-
-    npz_path = Path(args.save_embeddings)
-    Path(args.save_embeddings).parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        args.save_embeddings,
-        features=features,
-        sources=metadata["sources"],
-        image_indices=metadata["image_indices"],
-        class_labels=metadata["class_labels"],
-        token_indices=metadata["token_indices"],
-        class_to_idx=dataset.class_to_idx,
-        pca_mean=None if pca_info is None else pca_info["mean"],
-        pca_components=None if pca_info is None else pca_info["components"],
+    # 1) 按 source 收集特征：每个 source 一个 [N_src, D_src] 的矩阵
+    features_by_source, metadata_by_source, counters = collect_embeddings(
+        model, loader, device, args, siglip_pooler=siglip_pooler
     )
-    print(f"[UMAP] Saved feature matrix {features.shape} to {args.save_embeddings}")
+
+    base_npz_path = Path(args.save_embeddings)
+    if not args.skip_save:
+        base_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base_plot_path = Path(args.plot_path)
+    base_plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 2) 每个 source 单独 PCA / UMAP / 保存 / 画图
+    for source_name, feats in features_by_source.items():
+        metadata = metadata_by_source[source_name]
+        print(f"[UMAP] Source '{source_name}': feature matrix {feats.shape}")
+
+        # 每个 source 自己的 PCA（单独可视化）
+        pca_info = None
+        feats_for_umap = feats
+        if (not args.skip_pca) and args.pca_dim and feats.shape[1] > args.pca_dim:
+            feats_for_umap, pca_info = apply_pca(feats, args.pca_dim)
+            print(
+                f"[UMAP] Applied PCA for '{source_name}' "
+                f"from {feats.shape[1]} dims to {feats_for_umap.shape[1]} dims (target {args.pca_dim})."
+            )
+
+        # 保存这个 source 的特征 + PCA 信息
+        npz_path = base_npz_path.with_name(f"{base_npz_path.stem}_{source_name}{base_npz_path.suffix}")
+        if not args.skip_save:
+            np.savez(
+                npz_path,
+                features=feats_for_umap,
+                sources=metadata["sources"],
+                image_indices=metadata["image_indices"],
+                class_labels=metadata["class_labels"],
+                token_indices=metadata["token_indices"],
+                class_to_idx=dataset.class_to_idx,
+                pca_mean=None if pca_info is None else pca_info["mean"],
+                pca_components=None if pca_info is None else pca_info["components"],
+            )
+            print(f"[UMAP] Saved feature matrix for '{source_name}' ({feats_for_umap.shape}) to {npz_path}")
+
+        # UMAP + 保存 embedding + 单 source 图
+        if not args.skip_umap:
+            embedding = run_umap(feats_for_umap, args)
+            if not args.skip_save:
+                umap_npz_path = npz_path.with_name(npz_path.stem + "_umap.npz")
+                np.savez(
+                    umap_npz_path,
+                    embedding=embedding,
+                    sources=metadata["sources"],
+                    image_indices=metadata["image_indices"],
+                    class_labels=metadata["class_labels"],
+                    token_indices=metadata["token_indices"],
+                )
+                print(f"[UMAP] Saved UMAP embedding for '{source_name}' to {umap_npz_path}")
+
+            if not args.skip_plot:
+                plot_path = base_plot_path.with_name(
+                    f"{base_plot_path.stem}_{source_name}{base_plot_path.suffix}"
+                )
+                old_plot_path = args.plot_path
+                args.plot_path = str(plot_path)
+                # 单 source 图，legend 里可以是类名
+                plot_embedding(embedding, metadata, args, class_names=dataset.classes)
+                args.plot_path = old_plot_path
+                print(f"[UMAP] Plot for '{source_name}' stored at {plot_path}")
+
+    # 3) 额外：siglip + recon 合在一起跑一次 UMAP，用颜色=class，marker=source
+    if (
+        (not args.skip_umap)
+        and (not args.skip_plot)
+        and "siglip" in features_by_source
+        and "recon" in features_by_source
+    ):
+        feats_sig = features_by_source["siglip"]
+        feats_rec = features_by_source["recon"]
+
+        # 用原始特征拼在一起，再统一做一次 PCA（保证在同一线性空间）
+        combined_feats = np.concatenate([feats_sig, feats_rec], axis=0)
+        if (not args.skip_pca) and args.pca_dim and combined_feats.shape[1] > args.pca_dim:
+            combined_feats, _ = apply_pca(combined_feats, args.pca_dim)
+            print(
+                f"[UMAP] Combined PCA for siglip+recon from {feats_sig.shape[1]} dims "
+                f"to {combined_feats.shape[1]} dims (target {args.pca_dim})."
+            )
+
+        combined_embedding = run_umap(combined_feats, args)
+
+        combined_plot_path = base_plot_path.with_name(
+            f"{base_plot_path.stem}_siglip_recon_combined{base_plot_path.suffix}"
+        )
+        plot_combined_siglip_recon(
+            combined_embedding,
+            metadata_by_source["siglip"],
+            metadata_by_source["recon"],
+            args,
+            class_names=dataset.classes,
+            plot_path=str(combined_plot_path),
+        )
+
+    # 打印各 source 的样本数
     for source_name, count in counters.items():
         print(f"[UMAP] {source_name}: {count} samples")
-
-    embedding = None
-    if not args.skip_umap:
-        embedding = run_umap(features, args)
-        np.savez(
-            npz_path.with_name(npz_path.stem + "_umap.npz"),
-            embedding=embedding,
-            sources=metadata["sources"],
-            image_indices=metadata["image_indices"],
-            class_labels=metadata["class_labels"],
-            token_indices=metadata["token_indices"],
-        )
-        print(f"[UMAP] Saved UMAP embedding to {npz_path.with_name(npz_path.stem + '_umap.npz')}")
-
-    if embedding is not None and not args.skip_plot:
-        plot_embedding(embedding, metadata, args)
-        print(f"[UMAP] Plot stored at {args.plot_path}")
 
 
 if __name__ == "__main__":
